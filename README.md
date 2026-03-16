@@ -145,6 +145,7 @@ let logits = loaded.model.forward(&tokens, 0);
 - [ ] wgpu compute shaders for GPU inference
 - [ ] Float matmul path (standard GGUF models alongside ternary)
 - [ ] Heuristic stop conditions for base models
+- [ ] Block Attention Residuals ([MoonshotAI/Attention-Residuals](https://github.com/MoonshotAI/Attention-Residuals)) — learned depth-attention at block boundaries, drop-in quality boost for small models
 
 ## License
 
