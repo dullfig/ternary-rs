@@ -122,7 +122,7 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         }
     };
 
-    // Auto-detect compute backend (scalar / AVX2 / etc.)
+    // Auto-detect compute backend (scalar / AVX2 / wgpu)
     let backend = compute::detect();
     eprintln!("  [boot] Compute: {} ternary kernel", backend.name());
     info!(backend = backend.name(), "compute backend selected");

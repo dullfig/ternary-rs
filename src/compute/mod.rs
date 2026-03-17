@@ -17,6 +17,8 @@ pub mod scalar;
 pub mod device;
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
+#[cfg(feature = "gpu")]
+pub mod wgpu_backend;
 
 use crate::tensor::TernaryTensor;
 
@@ -101,12 +103,45 @@ impl CpuFeatures {
     }
 }
 
-/// Auto-detect the fastest available backend for this CPU.
+/// Auto-detect the fastest available backend.
 ///
+/// Priority: wgpu (GPU) → AVX2 → scalar.
 /// Returns an `Arc<dyn ComputeBackend>` ready to be shared across layers.
 pub fn detect() -> std::sync::Arc<dyn ComputeBackend> {
     let features = CpuFeatures::detect();
     tracing::info!(?features, "detecting compute backend");
+
+    // Try GPU — but only prefer it over AVX2 for discrete GPUs.
+    // Integrated GPUs share memory bandwidth with the CPU, so AVX2
+    // typically wins (benchmarked: Iris Xe 6× slower than AVX2).
+    #[cfg(feature = "gpu")]
+    {
+        let has_fast_cpu = {
+            #[cfg(target_arch = "x86_64")]
+            { features.avx2 }
+            #[cfg(not(target_arch = "x86_64"))]
+            { false }
+        };
+
+        let prefer_gpu = if has_fast_cpu {
+            // Only prefer GPU if we have a discrete adapter
+            device::HardwareInfo::detect()
+                .gpus
+                .iter()
+                .any(|g| g.device_type == device::GpuDeviceType::Discrete)
+        } else {
+            true // No fast CPU SIMD → any GPU is better than scalar
+        };
+
+        if prefer_gpu {
+            if let Some(gpu) = wgpu_backend::WgpuBackend::try_new() {
+                tracing::info!("using wgpu compute backend (discrete GPU)");
+                return std::sync::Arc::new(gpu);
+            }
+        } else {
+            tracing::info!("integrated GPU detected, preferring CPU SIMD");
+        }
+    }
 
     #[cfg(target_arch = "x86_64")]
     if features.avx2 {
@@ -115,6 +150,21 @@ pub fn detect() -> std::sync::Arc<dyn ComputeBackend> {
     }
 
     tracing::info!("using scalar compute backend");
+    std::sync::Arc::new(scalar::ScalarBackend)
+}
+
+/// Auto-detect the fastest CPU-only backend (skip GPU).
+///
+/// Useful when you want deterministic CPU results or when the GPU
+/// is reserved for other work.
+pub fn detect_cpu_only() -> std::sync::Arc<dyn ComputeBackend> {
+    let features = CpuFeatures::detect();
+
+    #[cfg(target_arch = "x86_64")]
+    if features.avx2 {
+        return std::sync::Arc::new(avx2::Avx2Backend);
+    }
+
     std::sync::Arc::new(scalar::ScalarBackend)
 }
 

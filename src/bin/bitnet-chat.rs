@@ -224,7 +224,10 @@ fn main() {
             // Track recent text to detect multi-token stop markers
             recent_text.push_str(&text);
             if recent_text.len() > 50 {
-                recent_text = recent_text[recent_text.len() - 50..].to_string();
+                // Find a char boundary near the trim point
+                let trim_target = recent_text.len() - 50;
+                let safe_start = recent_text.ceil_char_boundary(trim_target);
+                recent_text = recent_text[safe_start..].to_string();
             }
 
             // Stop if we hit a role marker (model is trying to continue the template)

@@ -17,6 +17,11 @@ use crate::layers::rmsnorm::RmsNorm;
 use crate::layers::swiglu::SwiGLU;
 
 /// A single transformer decoder block.
+///
+/// Supports optional Block Attention Residuals (MoonshotAI): learned
+/// per-block scaling of attention and FFN residual streams. When set,
+/// the residual connection becomes `h = x + α * sublayer(x)` instead
+/// of the standard `h = x + sublayer(x)`.
 pub struct TransformerBlock {
     /// Pre-attention normalization.
     attn_norm: RmsNorm,
@@ -28,6 +33,12 @@ pub struct TransformerBlock {
     ffn_norm: RmsNorm,
     /// SwiGLU feed-forward network.
     ffn: SwiGLU,
+    /// Attention residual scale (Block Attention Residuals).
+    /// 1.0 = standard residual connection.
+    attn_residual_scale: f32,
+    /// FFN residual scale (Block Attention Residuals).
+    /// 1.0 = standard residual connection.
+    ffn_residual_scale: f32,
 }
 
 impl TransformerBlock {
@@ -54,6 +65,8 @@ impl TransformerBlock {
             attention,
             ffn_norm,
             ffn,
+            attn_residual_scale: 1.0,
+            ffn_residual_scale: 1.0,
         }
     }
 
@@ -91,7 +104,19 @@ impl TransformerBlock {
             attention,
             ffn_norm,
             ffn,
+            attn_residual_scale: 1.0,
+            ffn_residual_scale: 1.0,
         }
+    }
+
+    /// Set Block Attention Residual scales (MoonshotAI).
+    ///
+    /// `attn_scale` modulates the attention sublayer output before
+    /// adding to the residual stream. `ffn_scale` does the same for FFN.
+    /// Values of 1.0 give standard residual connections.
+    pub fn set_residual_scales(&mut self, attn_scale: f32, ffn_scale: f32) {
+        self.attn_residual_scale = attn_scale;
+        self.ffn_residual_scale = ffn_scale;
     }
 
     /// Embedding dimension.
@@ -116,20 +141,24 @@ impl TransformerBlock {
         // 1. Attention sub-block with residual
         //    Note: attn_sub_norm (if present) is applied inside attention,
         //    before the O projection — see MultiHeadAttention::set_o_sub_norm().
+        //    Block Attention Residuals: h = x + α_attn * attn(norm(x))
         let normed_for_attn = self.norm_sequence(&self.attn_norm, input, seq_len);
         let attn_out = self.attention.forward(&normed_for_attn, seq_len, start_pos);
 
+        let attn_scale = self.attn_residual_scale;
         let mut h = Vec::with_capacity(input.len());
         for (x, a) in input.iter().zip(attn_out.iter()) {
-            h.push(x + a); // residual
+            h.push(x + attn_scale * a);
         }
 
         // 2. FFN sub-block with residual
+        //    Block Attention Residuals: out = h + α_ffn * ffn(norm(h))
         let normed_for_ffn = self.norm_sequence(&self.ffn_norm, &h, seq_len);
         let ffn_out = self.ffn.forward_sequence(&normed_for_ffn, seq_len);
 
+        let ffn_scale = self.ffn_residual_scale;
         for (h_val, f_val) in h.iter_mut().zip(ffn_out.iter()) {
-            *h_val += f_val; // residual
+            *h_val += ffn_scale * f_val;
         }
 
         h
@@ -147,21 +176,23 @@ impl TransformerBlock {
         let embed_dim = self.embed_dim();
         assert_eq!(input.len(), seq_len * embed_dim, "input shape mismatch");
 
-        // 1. Attention sub-block with residual
+        // 1. Attention sub-block with residual (Block Attention Residuals)
         let normed_for_attn = self.norm_sequence(&self.attn_norm, input, seq_len);
         let attn_out = self.attention.forward_cached(&normed_for_attn, seq_len, cache);
 
+        let attn_scale = self.attn_residual_scale;
         let mut h = Vec::with_capacity(input.len());
         for (x, a) in input.iter().zip(attn_out.iter()) {
-            h.push(x + a);
+            h.push(x + attn_scale * a);
         }
 
-        // 2. FFN sub-block with residual
+        // 2. FFN sub-block with residual (Block Attention Residuals)
         let normed_for_ffn = self.norm_sequence(&self.ffn_norm, &h, seq_len);
         let ffn_out = self.ffn.forward_sequence(&normed_for_ffn, seq_len);
 
+        let ffn_scale = self.ffn_residual_scale;
         for (h_val, f_val) in h.iter_mut().zip(ffn_out.iter()) {
-            *h_val += f_val;
+            *h_val += ffn_scale * f_val;
         }
 
         h
@@ -366,5 +397,59 @@ mod tests {
         let debug = format!("{:?}", block);
         assert!(debug.contains("TransformerBlock"));
         assert!(debug.contains("embed=8"));
+    }
+
+    #[test]
+    fn residual_scales_default_to_one() {
+        let block = make_test_block(8, 2, 2, 16);
+        // Default scales = 1.0 means standard residual
+        let input = vec![1.0f32; 8];
+        let output_default = block.forward(&input, 1, 0);
+
+        // Explicitly set to 1.0 — should give identical output
+        let mut block2 = make_test_block(8, 2, 2, 16);
+        block2.set_residual_scales(1.0, 1.0);
+        let output_explicit = block2.forward(&input, 1, 0);
+
+        for (a, b) in output_default.iter().zip(output_explicit.iter()) {
+            assert!((a - b).abs() < 1e-7, "scale=1.0 should match default");
+        }
+    }
+
+    #[test]
+    fn residual_scales_zero_skips_sublayers() {
+        // With scale=0.0, the sublayer output is zeroed out.
+        // The residual connection becomes h = x + 0*sublayer(x) = x for each sub-block.
+        let mut block = make_test_block(8, 2, 2, 16);
+        block.set_residual_scales(0.0, 0.0);
+
+        let input = vec![0.5f32; 8];
+        let output = block.forward(&input, 1, 0);
+
+        // Output should equal the input (both sublayers are suppressed)
+        for (i, (x, y)) in input.iter().zip(output.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-5,
+                "with zero scales, output[{i}] should match input: {x} vs {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_scales_affect_output() {
+        let input = vec![1.0f32; 8];
+
+        let block_full = make_test_block(8, 2, 2, 16);
+        let out_full = block_full.forward(&input, 1, 0);
+
+        let mut block_half = make_test_block(8, 2, 2, 16);
+        block_half.set_residual_scales(0.5, 0.5);
+        let out_half = block_half.forward(&input, 1, 0);
+
+        // Different scales should produce different outputs
+        assert!(
+            out_full.iter().zip(out_half.iter()).any(|(a, b)| (a - b).abs() > 1e-5),
+            "different residual scales should produce different outputs"
+        );
     }
 }
