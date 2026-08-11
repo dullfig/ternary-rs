@@ -1,3 +1,9 @@
 target/
 *.gguf
 
+# Local agent state (SQLite index + WAL, machine-local settings).
+# Targeted rather than ignoring .claude/ wholesale, so shared agent
+# config can be committed later.
+.claude/memory-rlm.db*
+.claude/settings.local.json
+
