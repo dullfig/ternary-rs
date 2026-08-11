@@ -1,151 +1,135 @@
-//! wgpu compute backend — GPU ternary matvec via WGSL compute shaders.
+//! wgpu compute backend — shared GPU device, compiled pipelines, and the
+//! drop-in `ComputeBackend` impl for ternary matvec.
 //!
-//! Runs the ternary matmul hot path on Vulkan/DX12/Metal via wgpu.
-//! The kernel unpacks 2-bit packed weights and performs conditional
-//! add/sub/skip on 8-bit activations entirely on the GPU.
+//! ## Two-level architecture
 //!
-//! ## Strategy
+//! 1. **`GpuDevice`** — the shared GPU context: `wgpu::Device`, `wgpu::Queue`,
+//!    and all compiled `Pipelines`. Created once at startup, shared via
+//!    `Arc<GpuDevice>` across every layer that touches the GPU. This is the
+//!    central handle that `GpuBitLinear`, `GpuKvCache`, and the
+//!    `gpu_engine` dispatch functions all hold.
 //!
-//! One workgroup per output row (256 threads). Each thread strides
-//! across the column dimension accumulating partial sums, then a
-//! tree reduction in shared memory produces the final i32 result.
+//! 2. **`WgpuBackend`** — wraps an `Arc<GpuDevice>` and implements
+//!    `ComputeBackend` for the per-call ternary matvec drop-in path. This is
+//!    the *slow* path: it uploads the weight matrix on every call. Use this
+//!    only for testing or fall-back scenarios. For production, use
+//!    `GpuBitLinear` which keeps weights resident.
 //!
-//! ## Limitations
+//! ## Pipelines
 //!
-//! - Buffers are created fresh per call (no weight caching yet).
-//!   This is correct but leaves bandwidth on the table for repeated
-//!   calls with the same weight matrix.
-//! - Softmax, rmsnorm, elementwise_mul use the default (CPU) impls.
-//!   Only ternary_matvec runs on GPU — it's 90%+ of inference time.
+//! Four ternary-relevant shaders, loaded from `src/compute/shaders/`:
+//! - `ternary_matvec` — single-token decode path (used by both the
+//!   `ComputeBackend` impl above and by `GpuBitLinear` for decode).
+//! - `ternary_matmul_batch` — shared-memory tiled batched matmul for prefill.
+//! - `quantize_absmax_batch` — per-token i8 absmax activation quantization.
+//! - `relu2_mul_batch` — BitNet b1.58 SwiGLU activation (ReLU²(gate) * up).
+//!
+//! Bind group layouts are inferred from the shaders (`layout: None`).
+
+use std::sync::Arc;
 
 use crate::tensor::TernaryTensor;
 use super::ComputeBackend;
 
-/// WGSL compute shader source for ternary matvec.
+// ---------------------------------------------------------------------------
+// Pipelines — compiled compute pipelines for the ternary path
+// ---------------------------------------------------------------------------
+
+/// The set of compiled compute pipelines used by the ternary GPU path.
 ///
-/// Encoding: 0b00 = -1 (Neg), 0b01 = 0 (Zero), 0b10 = +1 (Pos).
-/// Activations are i8 packed 4-per-u32 (little-endian byte order).
-const SHADER_SOURCE: &str = r#"
-struct Params {
-    rows: u32,
-    cols: u32,
+/// Compiled once at `GpuDevice::try_new()` time. Each `wgpu::ComputePipeline`
+/// is cheap to clone-reference and bind in a compute pass.
+pub struct Pipelines {
+    /// Single-token ternary matvec. Entry point `ternary_matvec`.
+    /// Bindings (4): weights ro, activations ro, output rw, params uniform.
+    pub ternary_matvec: wgpu::ComputePipeline,
+
+    /// Batched, shared-memory tiled ternary matmul. Entry point `main`.
+    /// Bindings (5): weights ro, activations ro, act_scales ro, output rw, params uniform.
+    pub ternary_matmul_batch: wgpu::ComputePipeline,
+
+    /// Per-token absmax i8 activation quantization. Entry point `main`.
+    /// Bindings (4): input ro, output_q rw, output_scales rw, params uniform.
+    pub quantize_absmax_batch: wgpu::ComputePipeline,
+
+    /// BitNet ReLU²(gate) * up activation. Entry point `main`.
+    /// Bindings (4): gate ro, up ro, output rw, params uniform.
+    pub relu2_mul_batch: wgpu::ComputePipeline,
 }
 
-@group(0) @binding(0) var<storage, read> weights: array<u32>;
-@group(0) @binding(1) var<storage, read> activations: array<u32>;
-@group(0) @binding(2) var<storage, read_write> output: array<i32>;
-@group(0) @binding(3) var<uniform> params: Params;
+impl Pipelines {
+    /// Compile all pipelines from the WGSL shader files.
+    pub fn compile(device: &wgpu::Device) -> Self {
+        let make = |src: &str, label: &str, entry: &str| -> wgpu::ComputePipeline {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None, // Inferred from shader reflection.
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
 
-const WG_SIZE: u32 = 256u;
-var<workgroup> shared_acc: array<i32, 256>;
-
-@compute @workgroup_size(256)
-fn ternary_matvec(
-    @builtin(local_invocation_index) lid: u32,
-    @builtin(workgroup_id) wid: vec3<u32>,
-) {
-    let row = wid.x;
-    if (row >= params.rows) { return; }
-
-    let cols = params.cols;
-    var acc: i32 = 0;
-
-    // Each thread strides across columns by WG_SIZE
-    var col = lid;
-    while (col < cols) {
-        // --- Unpack 2-bit weight ---
-        // Global flat index in the ternary tensor
-        let flat = row * cols + col;
-        // 4 ternary values per byte, so byte index = flat / 4
-        let w_byte_idx = flat / 4u;
-        let w_bit_shift = (flat % 4u) * 2u;
-        // Weights buffer is array<u32>, extract the byte
-        let w_u32 = weights[w_byte_idx / 4u];
-        let w_byte = (w_u32 >> ((w_byte_idx % 4u) * 8u)) & 0xFFu;
-        let w_bits = (w_byte >> w_bit_shift) & 3u;
-
-        // --- Unpack i8 activation ---
-        let act_u32 = activations[col / 4u];
-        let act_byte = (act_u32 >> ((col % 4u) * 8u)) & 0xFFu;
-        // Sign-extend i8 → i32
-        var act_val: i32 = i32(act_byte);
-        if (act_val > 127) { act_val = act_val - 256; }
-
-        // --- Conditional add/sub/skip ---
-        if (w_bits == 0u) {        // Neg (-1)
-            acc -= act_val;
-        } else if (w_bits == 2u) { // Pos (+1)
-            acc += act_val;
+        Self {
+            ternary_matvec: make(
+                include_str!("shaders/ternary_matvec.wgsl"),
+                "ternary_matvec",
+                "ternary_matvec",
+            ),
+            ternary_matmul_batch: make(
+                include_str!("shaders/ternary_matmul_batch.wgsl"),
+                "ternary_matmul_batch",
+                "main",
+            ),
+            quantize_absmax_batch: make(
+                include_str!("shaders/quantize_absmax_batch.wgsl"),
+                "quantize_absmax_batch",
+                "main",
+            ),
+            relu2_mul_batch: make(
+                include_str!("shaders/relu2_mul_batch.wgsl"),
+                "relu2_mul_batch",
+                "main",
+            ),
         }
-        // 1u (Zero) and 3u (unused) → skip
-
-        col += WG_SIZE;
-    }
-
-    // --- Workgroup tree reduction ---
-    shared_acc[lid] = acc;
-    workgroupBarrier();
-
-    for (var s = WG_SIZE / 2u; s > 0u; s /= 2u) {
-        if (lid < s) {
-            shared_acc[lid] += shared_acc[lid + s];
-        }
-        workgroupBarrier();
-    }
-
-    if (lid == 0u) {
-        output[row] = shared_acc[0];
     }
 }
-"#;
 
-/// GPU compute backend using wgpu.
+// ---------------------------------------------------------------------------
+// GpuDevice — shared device, queue, and pipelines
+// ---------------------------------------------------------------------------
+
+/// Shared GPU context: device, queue, and compiled pipelines.
 ///
-/// Holds the device, queue, and precompiled pipeline. Created once at
-/// startup via `WgpuBackend::try_new()` and shared across all layers.
-pub struct WgpuBackend {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+/// Created once at startup, shared across all GPU-resident layers via
+/// `Arc<GpuDevice>`. Holds the compiled pipelines so they don't have to be
+/// re-bound per call.
+pub struct GpuDevice {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub pipelines: Pipelines,
 }
 
-impl std::fmt::Debug for WgpuBackend {
+impl std::fmt::Debug for GpuDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WgpuBackend")
+        write!(f, "GpuDevice")
     }
 }
 
-/// Params uniform: rows (u32) + cols (u32) = 8 bytes.
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct Params {
-    rows: u32,
-    cols: u32,
-}
-
-// bytemuck Pod/Zeroable is unavailable without the dep, so we implement
-// the unsafe conversions manually — these are plain u32 fields with
-// repr(C), so the transmute is always valid.
-
-impl Params {
-    fn as_bytes(&self) -> &[u8] {
-        let ptr = self as *const Self as *const u8;
-        // SAFETY: Params is repr(C) with only u32 fields, no padding.
-        unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<Self>()) }
-    }
-}
-
-impl WgpuBackend {
-    /// Try to create a wgpu backend. Returns `None` if no suitable GPU is found
-    /// or if device creation fails.
+impl GpuDevice {
+    /// Try to create a GPU device. Returns `None` if no suitable adapter
+    /// is found or device creation fails.
     pub fn try_new() -> Option<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        // Request a high-performance adapter
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
@@ -160,7 +144,6 @@ impl WgpuBackend {
             "wgpu adapter selected"
         );
 
-        // Request device with default limits
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("ternary-rs"),
@@ -172,84 +155,133 @@ impl WgpuBackend {
         ))
         .ok()?;
 
-        // Compile shader
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ternary_matvec"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
-        });
+        let pipelines = Pipelines::compile(&device);
 
-        // Bind group layout: weights, activations, output, params
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ternary_matvec_layout"),
-            entries: &[
-                // binding 0: weights (storage, read)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // binding 1: activations (storage, read)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // binding 2: output (storage, read_write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // binding 3: params (uniform)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        Some(Self { device, queue, pipelines })
+    }
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ternary_matvec_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("ternary_matvec_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("ternary_matvec"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        Some(Self {
-            device,
-            queue,
-            pipeline,
-            bind_group_layout,
+    /// Create a bind group from a pipeline and a list of buffers.
+    ///
+    /// Buffers are bound to `@binding(0)`, `@binding(1)`, etc., in order.
+    pub fn make_bind_group(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        buffers: &[&wgpu::Buffer],
+    ) -> wgpu::BindGroup {
+        let layout = pipeline.get_bind_group_layout(0);
+        let entries: Vec<wgpu::BindGroupEntry> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, buf)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: buf.as_entire_binding(),
+            })
+            .collect();
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &entries,
         })
+    }
+
+    /// Create a uniform buffer from a bytemuck-able params struct.
+    ///
+    /// Uses `queue.write_buffer` (not `create_buffer_init`) because the
+    /// latter's internal staging belt did not recycle reliably across
+    /// hundreds of per-dispatch params buffers in cortex — they hit a
+    /// "staging buffer in bind group" validation error around the 200th
+    /// call. `queue.write_buffer` manages its own staging at the queue
+    /// level and is the wgpu-recommended pattern for frequent small writes.
+    pub fn create_params_buffer<T: bytemuck::Pod>(&self, params: &T) -> wgpu::Buffer {
+        let size = std::mem::size_of::<T>() as u64;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytemuck::bytes_of(params));
+        buf
+    }
+
+    /// Create a storage buffer with initial data.
+    pub fn create_storage_buffer(&self, data: &[u8], label: &str) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: data,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        })
+    }
+
+    /// Create an empty storage buffer of a given size.
+    pub fn create_empty_buffer(&self, size: u64, label: &str) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Create a staging buffer for GPU→CPU readback.
+    pub fn create_staging_buffer(&self, size: u64) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WgpuBackend — drop-in ComputeBackend impl
+// ---------------------------------------------------------------------------
+
+/// Drop-in GPU compute backend wrapping a shared `GpuDevice`.
+///
+/// Implements `ComputeBackend::ternary_matvec` by uploading the weight
+/// matrix, activation vector, and reading back the i32 output **on every
+/// call**. This is the slow path — use `GpuBitLinear` for resident weights
+/// in production.
+pub struct WgpuBackend {
+    gpu: Arc<GpuDevice>,
+}
+
+impl std::fmt::Debug for WgpuBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WgpuBackend")
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatvecParams {
+    rows: u32,
+    cols: u32,
+}
+
+impl WgpuBackend {
+    /// Try to create a wgpu backend. Returns `None` if GPU initialization fails.
+    pub fn try_new() -> Option<Self> {
+        let gpu = GpuDevice::try_new()?;
+        Some(Self { gpu: Arc::new(gpu) })
+    }
+
+    /// Construct from an already-built `Arc<GpuDevice>` (sharing the device
+    /// with `GpuBitLinear` / other resident-weight layers).
+    pub fn from_device(gpu: Arc<GpuDevice>) -> Self {
+        Self { gpu }
+    }
+
+    /// Access the shared `GpuDevice` for other layers to clone-reference.
+    pub fn device(&self) -> &Arc<GpuDevice> {
+        &self.gpu
     }
 
     /// Pad a byte slice to 4-byte alignment (wgpu requirement).
@@ -264,8 +296,7 @@ impl WgpuBackend {
         }
     }
 
-    /// Pack i8 activations into a byte buffer (they're already byte-sized,
-    /// but we need to ensure u32 alignment for the GPU buffer).
+    /// Pack i8 activations into a u32-aligned byte buffer.
     fn pack_activations(input: &[i8]) -> Vec<u8> {
         let mut bytes: Vec<u8> = input.iter().map(|&v| v as u8).collect();
         let remainder = bytes.len() % 4;
@@ -289,68 +320,26 @@ impl ComputeBackend for WgpuBackend {
             return vec![0i32; rows];
         }
 
-        // Pad weight data to u32 alignment
         let weight_bytes = Self::pad_to_u32(weights.packed_data());
         let act_bytes = Self::pack_activations(input);
         let output_size = (rows * std::mem::size_of::<i32>()) as u64;
 
-        // Create GPU buffers
-        let weight_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("weights"),
-            size: weight_bytes.len() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&weight_buf, 0, &weight_bytes);
-
-        let act_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("activations"),
-            size: act_bytes.len() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&act_buf, 0, &act_bytes);
-
-        let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("output"),
-            size: output_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size: output_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let params = Params {
+        let weight_buf = self.gpu.create_storage_buffer(&weight_bytes, "weights");
+        let act_buf = self.gpu.create_storage_buffer(&act_bytes, "activations");
+        let output_buf = self.gpu.create_empty_buffer(output_size, "output");
+        let staging_buf = self.gpu.create_staging_buffer(output_size);
+        let params_buf = self.gpu.create_params_buffer(&MatvecParams {
             rows: rows as u32,
             cols: cols as u32,
-        };
-        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params"),
-            size: std::mem::size_of::<Params>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&params_buf, 0, params.as_bytes());
-
-        // Bind group
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ternary_matvec_bind"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: weight_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: act_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: output_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
-            ],
         });
 
-        // Dispatch
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let pipeline = &self.gpu.pipelines.ternary_matvec;
+        let bind_group = self.gpu.make_bind_group(
+            pipeline,
+            &[&weight_buf, &act_buf, &output_buf, &params_buf],
+        );
+
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("ternary_matvec_encoder"),
         });
 
@@ -359,21 +348,20 @@ impl ComputeBackend for WgpuBackend {
                 label: Some("ternary_matvec_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(rows as u32, 1, 1);
         }
 
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
-        self.queue.submit(Some(encoder.finish()));
+        self.gpu.queue.submit(Some(encoder.finish()));
 
-        // Read back
         let slice = staging_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::Maintain::Wait);
         rx.recv().expect("GPU readback failed").expect("buffer map failed");
 
         let data = slice.get_mapped_range();
@@ -477,14 +465,13 @@ mod tests {
         let Some(backend) = get_backend() else { return };
         let scalar = crate::compute::scalar::ScalarBackend;
 
-        // Pseudo-random weights and activations (deterministic)
         let rows = 64;
         let cols = 128;
         let mut weights_i8 = Vec::with_capacity(rows * cols);
         let mut rng: u64 = 0xDEAD_BEEF;
         for _ in 0..(rows * cols) {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let v = ((rng >> 33) % 3) as i8 - 1; // -1, 0, 1
+            let v = ((rng >> 33) % 3) as i8 - 1;
             weights_i8.push(v);
         }
         let w = weights_from_i8(&weights_i8, rows, cols);
@@ -510,7 +497,6 @@ mod tests {
         let Some(backend) = get_backend() else { return };
         let scalar = crate::compute::scalar::ScalarBackend;
 
-        // Realistic size: 2048 cols (embed_dim), 256 rows
         let rows = 256;
         let cols = 2048;
         let mut weights_i8 = Vec::with_capacity(rows * cols);

@@ -19,6 +19,8 @@ pub mod device;
 pub mod avx2;
 #[cfg(feature = "gpu")]
 pub mod wgpu_backend;
+#[cfg(feature = "gpu")]
+pub mod gpu_engine;
 
 use crate::tensor::TernaryTensor;
 

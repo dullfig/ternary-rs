@@ -6,6 +6,8 @@
 
 pub mod attention;
 pub mod bitlinear;
+#[cfg(feature = "gpu")]
+pub mod gpu_bitlinear;
 pub mod kv_cache;
 pub mod model;
 pub mod rmsnorm;
