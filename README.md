@@ -21,8 +21,8 @@ The result: 16x weight compression (2 bits vs 32), dramatically reduced memory b
 - **Full transformer stack** — embedding, RoPE, GQA attention, SwiGLU FFN, RMSNorm
 - **Tokenizer** — BPE tokenizer from GGUF metadata (no sentencepiece dependency)
 - **Sampler** — temperature, top-k, top-p, repetition penalty
-- **GPU detection** — wgpu-based hardware enumeration (compute shaders coming)
-- **259 tests**, zero clippy warnings, zero `unsafe`
+- **GPU backend** — wgpu hardware enumeration plus ternary compute shaders (matvec, batched matmul, absmax quant). CPU AVX2 is currently the faster path — see [STATUS.md](STATUS.md) for measured numbers.
+- **274 tests**, one unused-`unsafe` warning (cpuid wrapper), zero `unsafe` in hot paths
 
 ## Quick start
 
@@ -31,12 +31,16 @@ The result: 16x weight compression (2 bits vs 32), dramatically reduced memory b
 Download the BitNet b1.58-2B model in GGUF format:
 
 ```bash
-# From HuggingFace (requires git-lfs)
+# Direct download (no git-lfs needed), ~1.1GB
+mkdir -p models
+curl -L -o models/ggml-model-i2_s.gguf \
+  https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf
+
+# Or clone the whole HuggingFace repo (requires git-lfs)
 git clone https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf
-# The model file is BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf (~500MB)
 ```
 
-Or download directly from: https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf
+HF repo: https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf
 
 ### Chat with the model
 
@@ -135,17 +139,24 @@ let logits = loaded.model.forward(&tokens, 0);
 
 ## Roadmap
 
-- [x] GGUF model loader (TQ1_0, TQ2_0, F16, BF16, F32)
+See [STATUS.md](STATUS.md) for the current status board with file-level detail and the perf baseline. High-level:
+
+- [x] GGUF model loader (TQ1_0, TQ2_0, I2S, F16, BF16, F32)
 - [x] Full transformer stack (RoPE, GQA, SwiGLU, RMSNorm)
 - [x] BPE tokenizer from GGUF metadata
 - [x] Sampler (temperature, top-k, top-p, repetition penalty)
-- [x] Hardware detection + boot banner
-- [ ] KV cache for autoregressive generation
-- [ ] SIMD kernels (x86 AVX2/512, ARM NEON)
-- [ ] wgpu compute shaders for GPU inference
-- [ ] Float matmul path (standard GGUF models alongside ternary)
+- [x] KV cache for autoregressive generation
+- [x] AVX2 ternary kernel (x86)
+- [x] wgpu GPU backend (initial substrate)
+- [x] Hardware detection + smart backend selection
+- [x] GPU substrate from cortex (batched shaders, resident-weight `gpu_bitlinear`)
+- [ ] Wire the resident-weight GPU path into the model, and make backend selection measurement-driven
+- [ ] AVX-512 and ARM NEON kernels
 - [ ] Heuristic stop conditions for base models
 - [ ] Block Attention Residuals ([MoonshotAI/Attention-Residuals](https://github.com/MoonshotAI/Attention-Residuals)) — learned depth-attention at block boundaries, drop-in quality boost for small models
+- [ ] FPGA deployment (Zynqberry → cascaded FPGA pipeline)
+
+Out of scope: standard quantized formats (Q4_K_M, Q8_0, etc.). Those belong in the sibling [cortex](https://github.com/dullfig/cortex) project, not here — ternary-rs is single-representation by design.
 
 ## License
 

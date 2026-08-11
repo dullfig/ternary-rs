@@ -6,8 +6,9 @@
 //! 1. **`GpuDevice`** — the shared GPU context: `wgpu::Device`, `wgpu::Queue`,
 //!    and all compiled `Pipelines`. Created once at startup, shared via
 //!    `Arc<GpuDevice>` across every layer that touches the GPU. This is the
-//!    central handle that `GpuBitLinear`, `GpuKvCache`, and the
-//!    `gpu_engine` dispatch functions all hold.
+//!    central handle that `GpuBitLinear` and the `gpu_engine` dispatch
+//!    functions hold. (A resident `GpuKvCache` is planned but not yet
+//!    ported — see DELTA_REPORT step 3.)
 //!
 //! 2. **`WgpuBackend`** — wraps an `Arc<GpuDevice>` and implements
 //!    `ComputeBackend` for the per-call ternary matvec drop-in path. This is

@@ -55,25 +55,18 @@ Pure-Rust 1.58-bit inference engine. Ternary weights {-1, 0, +1}, zero multiplic
 
 ## Testing
 
-150 tests covering: bit packing roundtrips, I2S correctness, LUT-vs-I2S equivalence (exhaustive 9-combo), sub-byte alignment, quantization fidelity, layer forward passes, compression ratio, f16/bf16 conversion (normals/subnormals/inf/NaN), GGUF header/metadata/tensor parsing, TQ1_0 base-3 decode, TQ2_0 remap, RoPE properties (identity at pos 0, magnitude preservation, relative position, frequency hierarchy), softmax stability, GQA head grouping, causal masking, SiLU activation, SwiGLU gating, residual connections, full model forward pass with tied/untied embeddings.
+271 library tests covering: bit packing roundtrips, I2S correctness, LUT-vs-I2S equivalence (exhaustive 9-combo), sub-byte alignment, quantization fidelity, layer forward passes, compression ratio, f16/bf16 conversion (normals/subnormals/inf/NaN), GGUF header/metadata/tensor parsing, TQ1_0 base-3 decode, TQ2_0 remap, RoPE properties (identity at pos 0, magnitude preservation, relative position, frequency hierarchy), softmax stability, GQA head grouping, causal masking, SiLU activation, SwiGLU gating, residual connections, full model forward pass with tied/untied embeddings, KV-cache prefill+decode parity, sampler distribution properties.
 
 ## Roadmap
 
-- [x] GGUF model loader
-- [x] RoPE (rotary positional embeddings)
-- [x] Multi-head attention with ternary Q/K/V (GQA)
-- [x] SwiGLU feed-forward network
-- [x] Full transformer forward pass (TransformerModel)
-- [ ] KV cache for autoregressive generation
-- [ ] Token sampler (top-k, top-p, temperature)
-- [ ] SIMD kernels (x86 AVX2/512, ARM NEON) via std::arch
-- [ ] Engine trait matching SharedEngine interface
-- [ ] Wire GGUF loader → TransformerModel construction (load_model helper)
+The dynamic status board lives in **[STATUS.md](STATUS.md)** — what's built, what's in flight, what's next, what's discussed-only, and the current perf baseline. Read that for state; this file is for the load-bearing architecture.
 
 ## Design Principles
 
+- **Single representation**: Ternary {-1, 0, +1} weights only. Standard quantized formats (Q4_K_M, Q8_0, etc.) belong in the sibling cortex project, not here.
+- **F32 activations end-to-end**: i8 quant for the ternary matmul itself, but never pack intermediate activations to f16/bf16. (Learned from cortex's NaN saga during the merger period — see project memory.)
 - **Modular**: Each layer is a standalone struct. Swap RoPE for ALiBi, SwiGLU for GeGLU — one file change, other tests keep passing.
 - **Plain f32 at boundaries**: No custom tensor framework lock-in. Layers talk via `&[f32]`.
 - **Composition over inheritance**: TransformerBlock contains attention + FFN, doesn't subclass.
 - **Generic reader**: GGUF parser works with `Cursor<Vec<u8>>` in tests, `BufReader<File>` in prod.
-- **Zero unsafe**: All SIMD will go through safe abstractions (future).
+- **Zero unsafe** in hot paths. SIMD via safe abstractions; one tolerated `unused_unsafe` warning on the cpuid wrapper.

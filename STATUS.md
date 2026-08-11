@@ -1,220 +1,90 @@
-# agentos-bitnet — Status & Implementation Notes
+# ternary-rs status
 
-## What This Is
+Last refresh: 2026-08-11
 
-A pure-Rust 1.58-bit inference engine for ternary LLMs, built as a subproject of AgentOS. Inspired by Microsoft's [BitNet.cpp](https://github.com/microsoft/BitNet) but implemented from scratch in Rust with zero external ML dependencies. The goal: AgentOS owns the full inference stack, so `cargo build` is all you need — no CUDA, no Python, no C toolchain.
+## Built
 
-## Why It Matters For AgentOS
+- [x] Core ternary kernels — `src/ops/{matmul,lut,quantize}.rs` (I2S add/sub/skip, TL1 lookup-table, absmax 8-bit activation quant)
+- [x] Tensor types (TernaryTensor, ActivationTensor, FloatTensor) — `src/tensor.rs`
+- [x] Full layer stack — `src/layers/{bitlinear,rmsnorm,rope,attention,swiglu,transformer,model}.rs` (BitLinear, RMSNorm, RoPE, GQA attention, SwiGLU FFN, TransformerBlock, TransformerModel with tied/untied embedding)
+- [x] KV cache for autoregressive generation — `src/layers/kv_cache.rs`
+- [x] Sampler (temp, top-k, top-p, repetition penalty) — `src/layers/sampler.rs`
+- [x] BPE tokenizer from GGUF metadata — `src/tokenizer.rs`
+- [x] GGUF loader (TQ1_0, TQ2_0, I2S, F32, F16, BF16 for norms+embed) — `src/gguf.rs`
+- [x] `load_model()` helper wiring GGUF → TransformerModel — `src/loader.rs`
+- [x] Hardware detection + boot banner — `src/compute/device.rs`
+- [x] AVX2 ternary kernel — `src/compute/avx2.rs`
+- [x] Scalar fallback kernel — `src/compute/scalar.rs`
+- [x] wgpu GPU backend (initial substrate, ternary matmul shaders) — `src/compute/wgpu_backend.rs`
+- [x] Smart backend selection (CPU vs GPU based on detection) — `src/compute/mod.rs`
+- [x] `bitnet-chat` conversational TUI — `src/bin/bitnet-chat.rs`
+- [x] `gguf-info`, `bitnet-bench`, `bitnet-diag`, `bitnet-i2s-test` — `src/bin/*`
+- [x] GPU substrate absorbed from cortex (Stage 1) — `src/compute/gpu_engine.rs`, `src/layers/gpu_bitlinear.rs`, `src/compute/shaders/*.wgsl`. `WgpuBackend` split into a shared `GpuDevice` (Arc'd device + buffer helpers + compiled `Pipelines`) so layers can share one device and hold weights resident. **Substrate only — not on the inference path** (see In flight).
+- [x] 274 library tests passing, 1 unused-unsafe warning (cpuid wrapper)
+- [x] Block Attention Residuals listed in roadmap (per commit a84a318)
 
-AgentOS currently splits brain (cloud LLM via Anthropic API) from body (local Rust kernel). The local inference path (`code-llm` crate) exists but is narrowly scoped to constrained decoding for form-filling in the semantic router.
+## In flight
 
-BitNet b1.58 models use ternary weights {-1, 0, +1}, which means:
-- **No floating-point multiplication in the matmul hot loop** — just add, subtract, or skip
-- **16× memory compression** vs f32 (4 weights per byte)
-- **Models run on CPU at usable speed** — Microsoft reports 5-7 tok/s for 100B params on a single CPU
+- [~] **`GpuBitLinear` is built and tested but not wired into `TransformerModel`.** Its only references are `gpu_engine.rs` (itself uncalled) and doc comments. Inference still runs `BitLinear` against the per-call-upload `WgpuBackend`, which re-uploads the full weight matrix every call. This is why the GPU path is slow — see Perf baseline.
 
-This unlocks:
-1. **Fully air-gapped AgentOS** — no cloud dependency for inference
-2. **Bob routing locally** — concierge decisions without API roundtrip
-3. **Librarian running locally** — context curation at zero API cost
-4. **Pi 5 running the full stack** — not just the kernel, the thinking too
-5. **Replace code-llm entirely** — one less external dependency, full ownership
+## Next
 
-## Technical Foundation (BitNet b1.58 Paper)
+Priority order, by measured impact:
 
-Reference papers:
-- [The Era of 1-bit LLMs](https://arxiv.org/abs/2402.17764) — BitNet b1.58 architecture
-- [bitnet.cpp](https://arxiv.org/abs/2410.16144) — Optimized CPU inference kernels
+- [ ] **Fix backend selection — it currently costs ~5×.** `compute::detect()` prefers any *discrete* GPU over AVX2. On this box that picks wgpu (2.6 tok/s) over AVX2 (12.4 tok/s est). The heuristic's premise — "discrete GPU beats AVX2" — is false for the current per-call-upload kernel. Make it measurement-driven, not presence-driven (DELTA_REPORT step 6). Cheapest available win.
+- [ ] **Wire `GpuBitLinear` into `TransformerModel`.** The resident-weight path is the reason the substrate was imported; until the model uses it, the import buys nothing at runtime. This is the change that can make the GPU path genuinely win.
+- [ ] Port `gpu_kv_cache.rs` from cortex (DELTA_REPORT step 3) — per-layer resident K/V buffers, no per-token upload/readback.
+- [ ] AVX-512 and ARM NEON ternary kernels
+- [ ] Heuristic stop conditions for base models (chat currently relies on role-marker scan, no rambling detection)
+- [ ] Block Attention Residuals (MoonshotAI/Attention-Residuals) — learned depth-attention at block boundaries
+- [ ] Stage 2: perf threshold framework + phantom-work audit + benchmark suite (modeled on cortex's `project_cortex_v1_perf_threshold`)
 
-### How It Works
+## Discussed only
 
-**Architecture**: Standard LLaMA transformer with all `nn.Linear` layers replaced by `BitLinear`:
-- Weights: ternary {-1, 0, +1}, quantized during training via `W̃ = RoundClip(W/γ, -1, 1)` where γ = mean(|W|)
-- Activations: 8-bit quantized per-token via absmax scaling
-- No bias terms
-- Uses RMSNorm (not LayerNorm), SwiGLU activation, rotary positional embeddings (RoPE)
+- [?] Stage 3+: composable with cortex via Q-Former adapter (per `project_unified_memory_architecture` pin in ringhub-integration) — not specced, not active
+- [?] Stage 4+: FPGA deployment via Zynqberry, eventually cascaded FPGA pipeline (per `project_zynqberry_bitnet_memex` pin) — not specced, not active
+- [?] Engine trait matching agentos's SharedEngine interface — pinned in CLAUDE.md history but not currently scoped; agentos-claude will drive the API when it's needed
 
-**Forward pass through BitLinear**:
-1. Quantize input activations to 8-bit: `scale = max(|x|)/127`, `x_q = round(x/scale)`
-2. Ternary matmul (integer accumulation): for each weight, add (+1), subtract (-1), or skip (0)
-3. Rescale output: `y = accumulator * activation_scale * weight_scale_γ`
+## Perf baseline
 
-**Two kernel strategies for the matmul**:
-- **I2S**: Unpack 2-bit weights from bytes, conditional add/sub per weight. Simple, good baseline.
-- **TL1 (Lookup Table)**: Group 2 weights into a 4-bit index. Precompute all 9 possible dot products for each activation pair. Inner loop is pure table lookup — zero arithmetic.
+BitNet b1.58 2B (Microsoft), 30 layers, 2560 embed, 128256 vocab, 1.58 GB ternary weights, 4096 ctx.
+Hardware: Intel i9-14900HX + RTX 4080 Laptop (discrete). Model load: 5.3 s.
 
-### Weight Encoding
+**Measured 2026-08-11**, after the Stage 1 substrate import, `--release`:
 
-Ternary values pack into 2 bits:
-```
-0b00 = -1
-0b01 =  0
-0b10 = +1
-0b11 = unused (treated as zero)
-```
-4 weights per byte, little-endian bit order: `[w0:2][w1:2][w2:2][w3:2]`.
+End-to-end (`bitnet-chat`, auto-selected backend = wgpu):
 
-### LUT-9 Indexing
+| Phase | Tokens | Time | Rate |
+|---|---|---|---|
+| Prefill | 8 | 3192 ms | 3 tok/s |
+| Decode | 64 | 25820 ms | **2.5 tok/s** |
 
-For a pair of weights (w0, w1) and activations (a0, a1), the 9 possible outcomes:
-```
-idx  w0  w1  result
- 0   -1  -1  -a0 - a1
- 1   -1   0  -a0
- 2   -1  +1  -a0 + a1
- 3    0  -1       - a1
- 4    0   0         0
- 5    0  +1       + a1
- 6   +1  -1  +a0 - a1
- 7   +1   0  +a0
- 8   +1  +1  +a0 + a1
-```
+Per-matvec (`bitnet-bench`, all backends cross-checked against scalar — all VERIFIED):
 
-The 4-bit packed pair `w0_bits | (w1_bits << 2)` indexes through a 16-entry remap table (`PAIR_TO_LUT_INDEX`) to select the correct LUT entry. The remap handles the sparse mapping (only 9 of 16 bit patterns are valid).
+| Backend | Q proj 2560×2560 | FFN gate 6912×2560 | Full-model est. |
+|---|---|---|---|
+| scalar | 18548 µs | 59466 µs | 0.1 tok/s |
+| avx2 | 211 µs | 614 µs | **12.4 tok/s** |
+| wgpu | 1191 µs | 2617 µs | 2.6 tok/s |
 
-**Important implementation note**: The LUT index formula is `ternary_idx(w0) * 3 + ternary_idx(w1)`, where w0 is in the LOW bits (0-1) and w1 is in the HIGH bits (2-3) of the pair. Getting this ordering wrong causes silent corruption — we caught this in testing via exhaustive I2S cross-validation.
+**Reading:** the import changed nothing on the hot path, so decode is unmoved from the 2026-05-29
+baseline of 2 tok/s — expected, not a regression. The bench's wgpu estimate (2.6) landed within 4%
+of measured decode (2.5), which is what makes the AVX2 estimate (12.4 tok/s) credible: the engine is
+currently running ~5× slower than its own CPU kernel because `detect()` prefers the discrete GPU.
 
-## What's Built (Phase 1 — Foundation)
+AVX2 end-to-end is an estimate, not a measurement — there is no CLI flag or env override to force
+CPU-only, so it was not directly measured. Worth adding one.
 
-### Crate: `crates/bitnet/`
-- Added to workspace in root `Cargo.toml`
-- Dependencies: only `thiserror` and `tracing` (dev: `tempfile`)
-- **50 tests, all passing, zero warnings**
+## Architectural invariants
 
-### Module Map
+These are load-bearing and shouldn't be relaxed without going through the integration pin process:
 
-```
-crates/bitnet/src/
-├── lib.rs              # Public API, re-exports
-├── tensor.rs           # Core tensor types (480 lines)
-│   ├── Ternary         # Enum: Neg/Zero/Pos with 2-bit encoding
-│   ├── TernaryTensor   # 2-bit packed weight matrix
-│   ├── ActivationTensor # 8-bit quantized with f32 scale
-│   └── FloatTensor     # Plain f32 for norms/embeddings
-├── ops/
-│   ├── mod.rs          # Module declarations
-│   ├── matmul.rs       # I2S ternary matvec kernel (250 lines)
-│   ├── lut.rs          # TL1 lookup-table matvec kernel (290 lines)
-│   └── quantize.rs     # Absmax 8-bit quantization (130 lines)
-└── layers/
-    ├── mod.rs          # Module declarations
-    ├── bitlinear.rs    # BitLinear layer: quantize → matmul → rescale (175 lines)
-    └── rmsnorm.rs      # RMSNorm: (x/√mean(x²)+ε) * γ (100 lines)
-```
+- **Ternary only.** f16/Q4_K_M dequantization belongs in cortex, not here. Don't re-add a `LinearLayer` trait, `FloatLinear`, or K-quant dequant module.
+- **F32 activations end-to-end.** Never pack activations to f16/bf16. (Per `project_f32_activations_invariant` — learned from cortex's NaN saga during the merger period.)
+- **Plain f32 at layer boundaries.** No custom tensor framework lock-in; layers communicate via `&[f32]`.
+- **Zero `unsafe`.** SIMD via safe abstractions only.
+- **Ternary encoding:** `0b00 = -1`, `0b01 = 0`, `0b10 = +1`, `0b11` unused. GGUF TQ2_0 uses a different convention (0=neg, 1=zero, 2=pos) and is remapped on load.
 
-### Test Coverage
+## Background
 
-| Module | Tests | What's Covered |
-|--------|-------|----------------|
-| `tensor.rs` | 16 | Bit packing roundtrip, non-aligned cols, set/get, zeros, row_bytes with sub-byte offsets, activation quantize/dequantize, scale correctness, 16× compression ratio |
-| `ops/matmul.rs` | 10 | Identity, negation, mixed weights, all-zero/all-pos/all-neg, non-aligned cols, multi-row, scaled output, batch matmul, accumulator range safety |
-| `ops/lut.rs` | 8 | LUT-9 value correctness, pair index mapping, exhaustive 9-combo cross-validation vs I2S, aligned/unaligned/odd cols, multi-row, large dimension (512×64) |
-| `ops/quantize.rs` | 6 | Absmax scale, zero input, roundtrip fidelity, boundary clamping, per-token independence, in-place dequantize |
-| `layers/bitlinear.rs` | 5 | Identity forward, negation forward, scale factor, batch forward, debug format |
-| `layers/rmsnorm.rs` | 5 | Unit weight normalize, scale weights, mixed input, zero input with eps, forward_into equivalence |
-
-### Key Design Decisions
-
-1. **Sub-byte row alignment**: When `row * cols` isn't a multiple of 4, row data starts mid-byte. `row_bytes()` returns a `start_offset` that both kernels respect. This costs nothing for aligned dimensions (which real models always have) but prevents subtle bugs.
-
-2. **LUT cross-validation**: Every LUT test verifies against the I2S kernel. This is how we caught the `PAIR_TO_LUT_INDEX` transposition bug. The two kernels serve as mutual oracles.
-
-3. **i32 accumulators**: With 8-bit activations (max 127) and realistic hidden dims (≤ 16384), the worst-case accumulator is `127 × 16384 = 2,080,768`, well within i32 range. Verified by test.
-
-4. **No unsafe**: Matching AgentOS convention. SIMD will be added later via `std::arch` with safe wrappers, gated behind `cfg(target_arch)`.
-
-## What's Next (Phase 2 — Transformer Stack)
-
-Priority order for the next implementation session:
-
-### 2a. GGUF Model Loader (`gguf.rs`)
-- Parse GGUF header, metadata, and tensor blocks
-- Load ternary weights from I2_S quantized tensors
-- Load f32/f16 weights for embeddings and norms
-- Extract model hyperparameters (n_layers, n_heads, hidden_dim, vocab_size, etc.)
-- This unblocks running real pretrained models
-
-### 2b. Remaining Transformer Layers
-- **RoPE** (`layers/rope.rs`): Rotary positional embeddings — precompute sin/cos frequency pairs, apply complex rotation to Q/K
-- **Attention** (`layers/attention.rs`): Multi-head self-attention with ternary Q/K/V/O projections, KV cache support
-- **SwiGLU FFN** (`layers/ffn.rs`): `SwiGLU(x) = (xW_gate ⊙ SiLU(xW_up)) W_down` — three BitLinear layers per block
-- **Embedding** (`layers/embedding.rs`): Token embedding lookup (f16 weights, not ternary)
-
-### 2c. Full Transformer (`transformer.rs`)
-- `TransformerBlock`: RmsNorm → Attention → residual → RmsNorm → FFN → residual
-- `Transformer`: Embedding → N × TransformerBlock → RmsNorm → linear head → logits
-- Forward pass for a single token position (autoregressive)
-
-### 2d. Generation Pipeline
-- **KV Cache** (`kv_cache.rs`): Pre-allocated key/value buffers per layer, grow with sequence
-- **Sampler** (`sampler.rs`): Temperature, top-k, top-p, repetition penalty
-- **Engine** (`engine.rs`): High-level API matching AgentOS `SharedEngine` interface — `load_model()`, `generate()`, `complete_constrained()`
-
-### 2e. SIMD Acceleration
-- x86: AVX2 (256-bit), AVX-512 (512-bit) via `std::arch::x86_64`
-- ARM: NEON (128-bit) via `std::arch::aarch64`
-- Process 16-64 ternary weights per SIMD instruction
-- Safe wrappers, feature-gated, scalar fallback always available
-
-## How It Plugs Into AgentOS
-
-Current local inference path:
-```
-PipelineBuilder::with_local_inference()
-  → loads ~/.agentos/models/*.gguf
-  → creates SharedEngine (Arc<Mutex<InferenceEngine>>)
-  → InferenceEngine from code-llm crate (external dep)
-  → used by LocalFormFiller for constrained decoding
-  → falls back to CloudFormFiller if local fails
-```
-
-Target state:
-```
-PipelineBuilder::with_local_inference()
-  → loads ~/.agentos/models/*.gguf
-  → creates SharedEngine (Arc<Mutex<BitNetEngine>>)
-  → BitNetEngine from crates/bitnet (workspace crate, no external dep)
-  → full general-purpose inference, not just constrained decoding
-  → can run Bob, Librarian, specialists locally
-  → cloud becomes optional, not required
-```
-
-The key interface to implement in `engine.rs`:
-```rust
-pub struct BitNetEngine { /* loaded model, KV cache, config */ }
-
-impl BitNetEngine {
-    pub fn from_gguf(model_path: &Path, config: EngineConfig) -> Result<Self>;
-    pub fn generate(&mut self, prompt: &[u32], max_tokens: usize, sampler: &Sampler) -> Vec<u32>;
-    pub fn complete_constrained(&mut self, prompt: &str, constraint: &Schema, max_tokens: usize) -> String;
-}
-```
-
-## Build & Test
-
-```bash
-# From repo root (requires sibling repos: rust-pipeline, code-llm, d2)
-cargo test -p agentos-bitnet
-
-# If sibling repos aren't present, stub them:
-# mkdir -p ../code-llm/src ../rust-pipeline/src ../d2/src
-# echo '[package]\nname="code-llm"\nversion="0.1.0"\nedition="2021"' > ../code-llm/Cargo.toml
-# (same pattern for rust-pipeline → "rust-pipeline", d2 → "d2-ascii")
-# echo '// stub' > ../code-llm/src/lib.rs (etc.)
-```
-
-## Files Changed
-
-- `Cargo.toml` (root): Added `crates/bitnet` to workspace members
-- `crates/bitnet/Cargo.toml`: New crate manifest
-- `crates/bitnet/CLAUDE.md`: Agent-facing quick reference
-- `crates/bitnet/STATUS.md`: This file
-- `crates/bitnet/src/lib.rs`: Crate root, public API
-- `crates/bitnet/src/tensor.rs`: Ternary, ActivationTensor, FloatTensor
-- `crates/bitnet/src/ops/mod.rs`: Ops module
-- `crates/bitnet/src/ops/matmul.rs`: I2S ternary matmul kernel
-- `crates/bitnet/src/ops/lut.rs`: TL1 lookup-table kernel
-- `crates/bitnet/src/ops/quantize.rs`: 8-bit activation quantization
-- `crates/bitnet/src/layers/mod.rs`: Layers module
-- `crates/bitnet/src/layers/bitlinear.rs`: BitLinear ternary layer
-- `crates/bitnet/src/layers/rmsnorm.rs`: RMSNorm layer
+Ternary-rs was briefly subsumed into cortex during a "swiss army knife of transformers" phase. On 2026-05-29 that merger was reversed (the un-merge): cross-cutting cortex changes (PolarQuant matmul) kept breaking BitNet, requiring revert cycles. The architectural decision is to keep cortex (Qwen-class GPU) and ternary-rs (BitNet 1.58-bit) as sibling systems and eventually compose via a Q-Former adapter, rather than as variants of one transformer. The grounding pin is `project_training_time_representation` in `C:\src\ringhub-integration\memory\`.
