@@ -20,6 +20,8 @@ fn main() {
         eprintln!("  --top-p <f32>       Nucleus sampling (default: 0.9)");
         eprintln!("  --max-tokens <n>    Max tokens per response (default: 256)");
         eprintln!("  --max-seq <n>       Max sequence length / KV cache (default: 2048)");
+        eprintln!("  --backend <name>    Force compute backend: scalar | avx2 | wgpu");
+        eprintln!("                      (default: measure at startup, pick fastest)");
         std::process::exit(1);
     }
 
@@ -62,6 +64,17 @@ fn main() {
             }
             "--rep-window" => {
                 rep_window = args[i + 1].parse().expect("invalid --rep-window value");
+                i += 2;
+            }
+            "--backend" => {
+                let name = &args[i + 1];
+                if ternary_rs::compute::backend_by_name(name).is_none() {
+                    eprintln!("Unknown or unavailable backend: {name}");
+                    eprintln!("Available: scalar, avx2, wgpu");
+                    std::process::exit(1);
+                }
+                // detect() reads this at load time, so every layer picks it up.
+                std::env::set_var(ternary_rs::compute::BACKEND_ENV, name);
                 i += 2;
             }
             _ => {

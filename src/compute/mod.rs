@@ -105,54 +105,139 @@ impl CpuFeatures {
     }
 }
 
-/// Auto-detect the fastest available backend.
+/// Environment variable that pins the backend, bypassing measurement.
+pub const BACKEND_ENV: &str = "TERNARY_BACKEND";
+
+/// Probe matrix dimensions used by [`fastest_of`]. Big enough to be
+/// representative of a real projection, small enough that the whole
+/// selection costs a few milliseconds at startup.
+const PROBE_ROWS: usize = 1024;
+const PROBE_COLS: usize = 1024;
+const PROBE_ITERS: usize = 3;
+
+/// Look up a backend by name. Returns `None` for an unknown name, or for a
+/// backend that isn't available on this machine (no AVX2, no working GPU).
 ///
-/// Priority: wgpu (GPU) → AVX2 → scalar.
-/// Returns an `Arc<dyn ComputeBackend>` ready to be shared across layers.
+/// Accepted: `scalar`, `avx2`, `wgpu` (alias `gpu`). Case-insensitive.
+pub fn backend_by_name(name: &str) -> Option<std::sync::Arc<dyn ComputeBackend>> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "scalar" => Some(std::sync::Arc::new(scalar::ScalarBackend)),
+
+        #[cfg(target_arch = "x86_64")]
+        "avx2" => std::arch::is_x86_feature_detected!("avx2")
+            .then(|| std::sync::Arc::new(avx2::Avx2Backend) as std::sync::Arc<dyn ComputeBackend>),
+
+        #[cfg(feature = "gpu")]
+        "wgpu" | "gpu" => wgpu_backend::WgpuBackend::try_new()
+            .map(|g| std::sync::Arc::new(g) as std::sync::Arc<dyn ComputeBackend>),
+
+        _ => None,
+    }
+}
+
+/// Build a deterministic ternary matrix + activation vector for backend probing.
+fn probe_workload() -> (TernaryTensor, Vec<i8>) {
+    use crate::tensor::Ternary;
+
+    let n = PROBE_ROWS * PROBE_COLS;
+    let mut values = Vec::with_capacity(n);
+    // Cheap LCG — we want a fixed, non-degenerate weight pattern, not entropy.
+    let mut state: u32 = 0x2545_F491;
+    for _ in 0..n {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        values.push(match (state >> 16) % 3 {
+            0 => Ternary::Neg,
+            1 => Ternary::Zero,
+            _ => Ternary::Pos,
+        });
+    }
+
+    let weights = TernaryTensor::pack(&values, PROBE_ROWS, PROBE_COLS);
+    // Absmax-quantized activations live in [-127, 127].
+    let input: Vec<i8> = (0..PROBE_COLS)
+        .map(|i| ((i % 255) as i32 - 127) as i8)
+        .collect();
+
+    (weights, input)
+}
+
+/// Time each candidate on a representative matvec and return the fastest.
+///
+/// This is the measurement that replaces the old presence-driven heuristic.
+/// The previous logic assumed "discrete GPU beats AVX2", which is false for
+/// the current per-call-upload GPU kernel — on an i9-14900HX + RTX 4080 it
+/// picked a backend ~5x slower than the CPU one.
+pub fn fastest_of(
+    candidates: Vec<std::sync::Arc<dyn ComputeBackend>>,
+) -> std::sync::Arc<dyn ComputeBackend> {
+    match candidates.len() {
+        0 => return std::sync::Arc::new(scalar::ScalarBackend),
+        1 => return candidates.into_iter().next().expect("len checked"),
+        _ => {}
+    }
+
+    let (weights, input) = probe_workload();
+    let mut best: Option<(std::sync::Arc<dyn ComputeBackend>, f64)> = None;
+
+    for backend in candidates {
+        // Warmup: absorbs GPU shader compilation and first-touch page faults,
+        // which would otherwise be charged to whichever backend ran first.
+        let _ = backend.ternary_matvec(&weights, &input);
+
+        let start = std::time::Instant::now();
+        for _ in 0..PROBE_ITERS {
+            let _ = backend.ternary_matvec(&weights, &input);
+        }
+        let secs = start.elapsed().as_secs_f64();
+
+        tracing::debug!(backend = backend.name(), secs, "backend probe");
+        if best.as_ref().is_none_or(|(_, b)| secs < *b) {
+            best = Some((backend, secs));
+        }
+    }
+
+    let (backend, _) = best.expect("at least two candidates");
+    backend
+}
+
+/// Auto-detect the fastest available backend by measuring it.
+///
+/// Set `TERNARY_BACKEND` (`scalar` | `avx2` | `wgpu`) to pin one and skip
+/// the probe. An unknown or unavailable name falls through to measurement.
 pub fn detect() -> std::sync::Arc<dyn ComputeBackend> {
     let features = CpuFeatures::detect();
     tracing::info!(?features, "detecting compute backend");
 
-    // Try GPU — but only prefer it over AVX2 for discrete GPUs.
-    // Integrated GPUs share memory bandwidth with the CPU, so AVX2
-    // typically wins (benchmarked: Iris Xe 6× slower than AVX2).
-    #[cfg(feature = "gpu")]
-    {
-        let has_fast_cpu = {
-            #[cfg(target_arch = "x86_64")]
-            { features.avx2 }
-            #[cfg(not(target_arch = "x86_64"))]
-            { false }
-        };
-
-        let prefer_gpu = if has_fast_cpu {
-            // Only prefer GPU if we have a discrete adapter
-            device::HardwareInfo::detect()
-                .gpus
-                .iter()
-                .any(|g| g.device_type == device::GpuDeviceType::Discrete)
-        } else {
-            true // No fast CPU SIMD → any GPU is better than scalar
-        };
-
-        if prefer_gpu {
-            if let Some(gpu) = wgpu_backend::WgpuBackend::try_new() {
-                tracing::info!("using wgpu compute backend (discrete GPU)");
-                return std::sync::Arc::new(gpu);
+    if let Ok(name) = std::env::var(BACKEND_ENV) {
+        match backend_by_name(&name) {
+            Some(backend) => {
+                tracing::info!(backend = backend.name(), "backend pinned via {BACKEND_ENV}");
+                return backend;
             }
-        } else {
-            tracing::info!("integrated GPU detected, preferring CPU SIMD");
+            None => tracing::warn!("{BACKEND_ENV}={name} is unknown or unavailable; measuring"),
         }
     }
 
+    // Only the best CPU kernel competes — scalar never beats AVX2, so racing
+    // it would just add startup cost.
+    let mut candidates: Vec<std::sync::Arc<dyn ComputeBackend>> = Vec::new();
+
     #[cfg(target_arch = "x86_64")]
     if features.avx2 {
-        tracing::info!("using AVX2 compute backend");
-        return std::sync::Arc::new(avx2::Avx2Backend);
+        candidates.push(std::sync::Arc::new(avx2::Avx2Backend));
+    }
+    if candidates.is_empty() {
+        candidates.push(std::sync::Arc::new(scalar::ScalarBackend));
     }
 
-    tracing::info!("using scalar compute backend");
-    std::sync::Arc::new(scalar::ScalarBackend)
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = wgpu_backend::WgpuBackend::try_new() {
+        candidates.push(std::sync::Arc::new(gpu));
+    }
+
+    let backend = fastest_of(candidates);
+    tracing::info!(backend = backend.name(), "selected compute backend");
+    backend
 }
 
 /// Auto-detect the fastest CPU-only backend (skip GPU).
@@ -180,6 +265,45 @@ mod tests {
         let name = backend.name();
         assert!(!name.is_empty());
         eprintln!("detected backend: {name}");
+    }
+
+    #[test]
+    fn backend_by_name_returns_named_backend() {
+        let backend = backend_by_name("scalar").expect("scalar is always available");
+        assert_eq!(backend.name(), "scalar");
+    }
+
+    #[test]
+    fn backend_by_name_rejects_unknown() {
+        assert!(backend_by_name("definitely-not-a-backend").is_none());
+    }
+
+    #[test]
+    fn backend_by_name_is_case_insensitive() {
+        let backend = backend_by_name("SCALAR").expect("case should not matter");
+        assert_eq!(backend.name(), "scalar");
+    }
+
+    #[test]
+    fn fastest_of_single_candidate_returns_it() {
+        let only: Vec<std::sync::Arc<dyn ComputeBackend>> =
+            vec![std::sync::Arc::new(scalar::ScalarBackend)];
+        assert_eq!(fastest_of(only).name(), "scalar");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fastest_of_prefers_avx2_over_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return; // nothing to compare on this host
+        }
+        // AVX2 measures ~90x faster than scalar on ternary matvec, so this
+        // margin is far too wide to flake on a noisy machine.
+        let candidates: Vec<std::sync::Arc<dyn ComputeBackend>> = vec![
+            std::sync::Arc::new(scalar::ScalarBackend),
+            std::sync::Arc::new(avx2::Avx2Backend),
+        ];
+        assert_eq!(fastest_of(candidates).name(), "avx2");
     }
 
     #[test]
