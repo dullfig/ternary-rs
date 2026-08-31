@@ -17,8 +17,22 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+use rayon::prelude::*;
+
 use crate::tensor::TernaryTensor;
 use super::ComputeBackend;
+
+/// Below this many weights, thread dispatch costs more than it saves.
+/// Rayon task overhead is ~1 µs; a 64K-weight matvec is ~2 µs of work.
+const PARALLEL_MIN_WEIGHTS: usize = 1 << 16;
+
+/// Rows per parallel task. Aims for ~4 tasks per thread so rayon's work
+/// stealing can even out stragglers, with a floor so tiny matrices don't
+/// fragment into task overhead.
+fn chunk_rows(rows: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    rows.div_ceil(threads * 4).max(16)
+}
 
 /// AVX2 SIMD backend.
 #[derive(Debug, Clone, Copy)]
@@ -29,8 +43,29 @@ impl ComputeBackend for Avx2Backend {
 
     fn ternary_matvec(&self, weights: &TernaryTensor, input: &[i8]) -> Vec<i32> {
         assert_eq!(weights.cols(), input.len(), "dimension mismatch");
-        // SAFETY: We only construct Avx2Backend after checking is_x86_feature_detected!("avx2")
-        unsafe { avx2_ternary_matvec(weights, input) }
+
+        let rows = weights.rows();
+        let mut output = vec![0i32; rows];
+
+        // Each output row is an independent dot product over shared read-only
+        // weights and activations, so rows split across threads with no
+        // synchronization beyond the disjoint output chunks.
+        if rows * weights.cols() < PARALLEL_MIN_WEIGHTS {
+            // SAFETY: Avx2Backend is only constructed after is_x86_feature_detected!("avx2")
+            unsafe { avx2_ternary_matvec_rows(weights, input, 0, &mut output) };
+            return output;
+        }
+
+        let chunk = chunk_rows(rows);
+        output
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(i, out)| {
+                // SAFETY: as above; `i * chunk` is this chunk's first row.
+                unsafe { avx2_ternary_matvec_rows(weights, input, i * chunk, out) };
+            });
+
+        output
     }
 }
 
@@ -103,15 +138,22 @@ fn unpack_32_ternary_scalar(packed: &[u8]) -> [i8; 32] {
     signs
 }
 
-/// AVX2 ternary matrix-vector product.
+/// AVX2 ternary matrix-vector product over a contiguous slice of rows.
+///
+/// Computes rows `start_row .. start_row + out.len()`, writing row
+/// `start_row + j` into `out[j]`.
 ///
 /// # Safety
 /// Caller must ensure AVX2 is available.
 #[target_feature(enable = "avx2")]
-unsafe fn avx2_ternary_matvec(weights: &TernaryTensor, input: &[i8]) -> Vec<i32> {
-    let rows = weights.rows();
+unsafe fn avx2_ternary_matvec_rows(
+    weights: &TernaryTensor,
+    input: &[i8],
+    start_row: usize,
+    out: &mut [i32],
+) {
     let cols = weights.cols();
-    let mut output = vec![0i32; rows];
+    debug_assert!(start_row + out.len() <= weights.rows());
 
     let packed = weights.packed_data();
     let bytes_per_row = cols.div_ceil(4);
@@ -120,8 +162,8 @@ unsafe fn avx2_ternary_matvec(weights: &TernaryTensor, input: &[i8]) -> Vec<i32>
     let ones_u8 = _mm256_set1_epi8(1);
     let ones_16 = _mm256_set1_epi16(1);
 
-    #[allow(clippy::needless_range_loop)]
-    for row in 0..rows {
+    for j in 0..out.len() {
+        let row = start_row + j;
         let row_start = row * bytes_per_row;
         let row_data = &packed[row_start..row_start + bytes_per_row];
 
@@ -166,10 +208,8 @@ unsafe fn avx2_ternary_matvec(weights: &TernaryTensor, input: &[i8]) -> Vec<i32>
             col += 1;
         }
 
-        output[row] = row_acc;
+        out[j] = row_acc;
     }
-
-    output
 }
 
 /// Horizontal sum of 8 packed i32 values in a __m256i.
@@ -323,6 +363,38 @@ mod tests {
         let y = Avx2Backend.ternary_matvec(&w, &input);
         let expected: i32 = -(1..=cols as i32).sum::<i32>();
         assert_eq!(y[0], expected);
+    }
+
+    #[test]
+    fn avx2_matches_scalar_across_row_counts() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // The kernel splits rows across threads. Row counts here straddle
+        // chunk boundaries (prime, power-of-two, and non-multiples) so a bad
+        // start-row offset or a dropped final chunk shows up as a mismatch.
+        // Every other AVX2 test uses 4-8 rows, where chunking never engages.
+        let cols = 256;
+        for rows in [1, 7, 64, 129, 1000, 2560] {
+            let n = rows * cols;
+            let values: Vec<i8> = (0..n)
+                .map(|i| match i % 5 {
+                    0 | 1 => 1,
+                    2 => -1,
+                    _ => 0,
+                })
+                .collect();
+            let w = weights_from_i8(&values, rows, cols);
+            let input: Vec<i8> = (0..cols)
+                .map(|i| (((i * 13 + 5) % 254) as i32 - 127) as i8)
+                .collect();
+
+            let y_scalar = super::super::scalar::ScalarBackend.ternary_matvec(&w, &input);
+            let y_avx2 = Avx2Backend.ternary_matvec(&w, &input);
+
+            assert_eq!(y_avx2.len(), rows, "output length wrong at rows={rows}");
+            assert_eq!(y_scalar, y_avx2, "mismatch at rows={rows}");
+        }
     }
 
     #[test]
