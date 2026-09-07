@@ -1,6 +1,6 @@
 # ternary-rs status
 
-Last refresh: 2026-08-11
+Last refresh: 2026-08-15
 
 ## Built
 
@@ -13,14 +13,14 @@ Last refresh: 2026-08-11
 - [x] GGUF loader (TQ1_0, TQ2_0, I2S, F32, F16, BF16 for norms+embed) — `src/gguf.rs`
 - [x] `load_model()` helper wiring GGUF → TransformerModel — `src/loader.rs`
 - [x] Hardware detection + boot banner — `src/compute/device.rs`
-- [x] AVX2 ternary kernel — `src/compute/avx2.rs`
+- [x] AVX2 ternary kernel, multi-threaded over rows via rayon — `src/compute/avx2.rs`
 - [x] Scalar fallback kernel — `src/compute/scalar.rs`
 - [x] wgpu GPU backend (initial substrate, ternary matmul shaders) — `src/compute/wgpu_backend.rs`
-- [x] Smart backend selection (CPU vs GPU based on detection) — `src/compute/mod.rs`
+- [x] Measurement-driven backend selection — races candidates on a probe matvec at startup; `--backend` / `TERNARY_BACKEND` override — `src/compute/mod.rs`
 - [x] `bitnet-chat` conversational TUI — `src/bin/bitnet-chat.rs`
 - [x] `gguf-info`, `bitnet-bench`, `bitnet-diag`, `bitnet-i2s-test` — `src/bin/*`
 - [x] GPU substrate absorbed from cortex (Stage 1) — `src/compute/gpu_engine.rs`, `src/layers/gpu_bitlinear.rs`, `src/compute/shaders/*.wgsl`. `WgpuBackend` split into a shared `GpuDevice` (Arc'd device + buffer helpers + compiled `Pipelines`) so layers can share one device and hold weights resident. **Substrate only — not on the inference path** (see In flight).
-- [x] 274 library tests passing, 1 unused-unsafe warning (cpuid wrapper)
+- [x] 280 library tests passing, 1 unused-unsafe warning (cpuid wrapper)
 - [x] Block Attention Residuals listed in roadmap (per commit a84a318)
 
 ## In flight
@@ -31,8 +31,9 @@ Last refresh: 2026-08-11
 
 Priority order, by measured impact:
 
-- [ ] **Fix backend selection — it currently costs ~5×.** `compute::detect()` prefers any *discrete* GPU over AVX2. On this box that picks wgpu (2.6 tok/s) over AVX2 (12.4 tok/s est). The heuristic's premise — "discrete GPU beats AVX2" — is false for the current per-call-upload kernel. Make it measurement-driven, not presence-driven (DELTA_REPORT step 6). Cheapest available win.
-- [ ] **Wire `GpuBitLinear` into `TransformerModel`.** The resident-weight path is the reason the substrate was imported; until the model uses it, the import buys nothing at runtime. This is the change that can make the GPU path genuinely win.
+- [ ] **Reduce bytes moved per token.** Decode is now memory-bound (see Perf baseline), so this is where the remaining headroom is, not in more threads. Options not yet explored: fusing the three FFN projections to avoid re-streaming activations, keeping the output head's 82 MB out of the per-token path, blocking the weight walk for cache reuse.
+- [ ] **Close the gap between kernel and end-to-end.** The matvec microbenchmark projects 37.2 tok/s; real decode is 20.8. The difference is non-matmul work — attention, RMSNorm, RoPE, softmax, sampling — none of which is SIMD or threaded. Profile before optimizing.
+- [ ] **Wire `GpuBitLinear` into `TransformerModel`.** Still unwired. Note the bar moved: the GPU path must now beat 20.8 tok/s, not 2.5. Per-call overhead (~380 µs fixed × 210 matvecs/token) means resident weights alone won't do it — it needs the whole decode step resident, with one command buffer per token and only logits read back.
 - [ ] Port `gpu_kv_cache.rs` from cortex (DELTA_REPORT step 3) — per-layer resident K/V buffers, no per-token upload/readback.
 - [ ] AVX-512 and ARM NEON ternary kernels
 - [ ] Heuristic stop conditions for base models (chat currently relies on role-marker scan, no rambling detection)
@@ -50,30 +51,41 @@ Priority order, by measured impact:
 BitNet b1.58 2B (Microsoft), 30 layers, 2560 embed, 128256 vocab, 1.58 GB ternary weights, 4096 ctx.
 Hardware: Intel i9-14900HX + RTX 4080 Laptop (discrete). Model load: 5.3 s.
 
-**Measured 2026-08-11**, after the Stage 1 substrate import, `--release`:
+**Measured 2026-08-15**, `--release`, 64-token decode. All figures measured, none projected —
+force a backend with `--backend <scalar|avx2|wgpu>` or `TERNARY_BACKEND`.
 
-End-to-end (`bitnet-chat`, auto-selected backend = wgpu):
+End-to-end decode (`bitnet-chat`):
 
-| Phase | Tokens | Time | Rate |
-|---|---|---|---|
-| Prefill | 8 | 3192 ms | 3 tok/s |
-| Decode | 64 | 25820 ms | **2.5 tok/s** |
+| Backend | Decode | vs. previous |
+|---|---|---|
+| wgpu — old presence-driven selection | 2.5 tok/s | baseline |
+| avx2 — measurement-driven selection, serial kernel | 9.2 tok/s | 3.7× |
+| avx2 — parallel kernel *(current auto-selection)* | **20.8 tok/s** | 2.3× |
 
-Per-matvec (`bitnet-bench`, all backends cross-checked against scalar — all VERIFIED):
+**8.3× total.** Two changes: `detect()` now races candidates instead of assuming a discrete GPU
+wins, and the AVX2 matvec parallelizes over rows instead of running on one core of 32.
+
+Per-matvec (`bitnet-bench`, every backend cross-checked against scalar — all VERIFIED):
 
 | Backend | Q proj 2560×2560 | FFN gate 6912×2560 | Full-model est. |
 |---|---|---|---|
-| scalar | 18548 µs | 59466 µs | 0.1 tok/s |
-| avx2 | 211 µs | 614 µs | **12.4 tok/s** |
-| wgpu | 1191 µs | 2617 µs | 2.6 tok/s |
+| scalar | 20004 µs | 64701 µs | 0.1 tok/s |
+| avx2 | 57 µs | 223 µs | 37.2 tok/s |
+| wgpu | 1381 µs | 5455 µs | 1.5 tok/s |
 
-**Reading:** the import changed nothing on the hot path, so decode is unmoved from the 2026-05-29
-baseline of 2 tok/s — expected, not a regression. The bench's wgpu estimate (2.6) landed within 4%
-of measured decode (2.5), which is what makes the AVX2 estimate (12.4 tok/s) credible: the engine is
-currently running ~5× slower than its own CPU kernel because `detect()` prefers the discrete GPU.
+**Reading — decode is now memory-bound, not compute-bound.** The model streams ~603 MB of packed
+weights per token (521 MB across 30 layers, GQA-corrected, plus 82 MB for the output head). At
+20.8 tok/s that is ~12.5 GB/s; the gate matvec in isolation hits ~20 GB/s, which is about what this
+laptop's DDR5 sustains. That is why threading returned 2.3× and not core-count, and it means
+further gains come from moving fewer bytes, not from more threads.
 
-AVX2 end-to-end is an estimate, not a measurement — there is no CLI flag or env override to force
-CPU-only, so it was not directly measured. Worth adding one.
+Two caveats worth keeping in view:
+
+- The bench is **cache-warm** (Q proj is 1.6 MB, fits L2), so its full-model estimate flatters CPU:
+  it projected 12.4 tok/s for the serial kernel against 9.2 measured, and projects 37.2 against
+  20.8 now. Treat it as an upper bound on the kernel, not a prediction of decode.
+- The bench bills K and V at full Q size, but GQA makes them ¼ (`head_count=20`,
+  `head_count_kv=5`), overstating per-layer work by ~14%.
 
 ## Architectural invariants
 
@@ -82,7 +94,7 @@ These are load-bearing and shouldn't be relaxed without going through the integr
 - **Ternary only.** f16/Q4_K_M dequantization belongs in cortex, not here. Don't re-add a `LinearLayer` trait, `FloatLinear`, or K-quant dequant module.
 - **F32 activations end-to-end.** Never pack activations to f16/bf16. (Per `project_f32_activations_invariant` — learned from cortex's NaN saga during the merger period.)
 - **Plain f32 at layer boundaries.** No custom tensor framework lock-in; layers communicate via `&[f32]`.
-- **Zero `unsafe`.** SIMD via safe abstractions only.
+- **Zero `unsafe` in hot paths.** The AVX2 kernel uses `#[target_feature]` + intrinsics, which are unsafe by construction; those are the only `unsafe` blocks and each is guarded by runtime feature detection. Matches the wording in CLAUDE.md. (The stricter "zero `unsafe`, SIMD via safe abstractions only" claim this replaces was never true of `avx2.rs`.)
 - **Ternary encoding:** `0b00 = -1`, `0b01 = 0`, `0b10 = +1`, `0b11` unused. GGUF TQ2_0 uses a different convention (0=neg, 1=zero, 2=pos) and is remapped on load.
 
 ## Background
