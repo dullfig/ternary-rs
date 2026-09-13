@@ -1,6 +1,6 @@
 # ternary-rs status
 
-Last refresh: 2026-08-15
+Last refresh: 2026-09-12
 
 ## Built
 
@@ -14,13 +14,14 @@ Last refresh: 2026-08-15
 - [x] `load_model()` helper wiring GGUF → TransformerModel — `src/loader.rs`
 - [x] Hardware detection + boot banner — `src/compute/device.rs`
 - [x] AVX2 ternary kernel, multi-threaded over rows via rayon — `src/compute/avx2.rs`
+- [x] f16 embedding table kept at source precision; F16C `dot_f16` for the tied output projection — `src/tensor.rs` (`EmbeddingTable`), `src/compute/half.rs`
 - [x] Scalar fallback kernel — `src/compute/scalar.rs`
 - [x] wgpu GPU backend (initial substrate, ternary matmul shaders) — `src/compute/wgpu_backend.rs`
 - [x] Measurement-driven backend selection — races candidates on a probe matvec at startup; `--backend` / `TERNARY_BACKEND` override — `src/compute/mod.rs`
 - [x] `bitnet-chat` conversational TUI — `src/bin/bitnet-chat.rs`
 - [x] `gguf-info`, `bitnet-bench`, `bitnet-diag`, `bitnet-i2s-test` — `src/bin/*`
 - [x] GPU substrate absorbed from cortex (Stage 1) — `src/compute/gpu_engine.rs`, `src/layers/gpu_bitlinear.rs`, `src/compute/shaders/*.wgsl`. `WgpuBackend` split into a shared `GpuDevice` (Arc'd device + buffer helpers + compiled `Pipelines`) so layers can share one device and hold weights resident. **Substrate only — not on the inference path** (see In flight).
-- [x] 280 library tests passing, 1 unused-unsafe warning (cpuid wrapper)
+- [x] 288 library tests passing, 1 unused-unsafe warning (cpuid wrapper)
 - [x] Block Attention Residuals listed in roadmap (per commit a84a318)
 
 ## In flight
@@ -29,12 +30,24 @@ Last refresh: 2026-08-15
 
 ## Next
 
-Priority order, by measured impact:
+Priority order, by measured impact. **Profile first** — the last two rounds of
+guessing both picked the wrong target.
 
-- [ ] **Reduce bytes moved per token.** Decode is now memory-bound (see Perf baseline), so this is where the remaining headroom is, not in more threads. Options not yet explored: fusing the three FFN projections to avoid re-streaming activations, keeping the output head's 82 MB out of the per-token path, blocking the weight walk for cache reuse.
-- [ ] **Close the gap between kernel and end-to-end.** The matvec microbenchmark projects 37.2 tok/s; real decode is 20.8. The difference is non-matmul work — attention, RMSNorm, RoPE, softmax, sampling — none of which is SIMD or threaded. Profile before optimizing.
-- [ ] **Wire `GpuBitLinear` into `TransformerModel`.** Still unwired. Note the bar moved: the GPU path must now beat 20.8 tok/s, not 2.5. Per-call overhead (~380 µs fixed × 210 matvecs/token) means resident weights alone won't do it — it needs the whole decode step resident, with one command buffer per token and only logits read back.
-- [ ] Port `gpu_kv_cache.rs` from cortex (DELTA_REPORT step 3) — per-layer resident K/V buffers, no per-token upload/readback.
+- [ ] **Profile inside attention.** It streams only 123 MB but costs 12.5 ms/tok, 3× less
+  byte-efficient than FFN. Roughly 9 ms/tok — ~19% of decode — is something other than weight
+  streaming. Suspect per-head `Vec` allocation (20 heads × 30 layers × every token), but that is a
+  guess and needs measuring.
+- [ ] **Ternary kernel has real headroom.** FFN achieves 29.6 GB/s and attention 9.8 GB/s, against
+  65 GB/s demonstrated achievable on this box by the output projection. The blocks are
+  compute-bound, not bandwidth-bound — the opposite of what this file claimed before 2026-09-12.
+- [ ] **Teach `bitnet-bench` about the output projection.** It models 4×Q + 3×gate per layer and
+  stops, so it misses the largest single op in decode entirely. Its full-model estimates were
+  misleading for exactly that reason.
+- [ ] **Wire `GpuBitLinear` into `TransformerModel`.** Still unwired, and the bar keeps rising: the
+  GPU path must now beat 27.2 tok/s, not 2.5. Per-call overhead (~380 µs fixed × 210 matvecs/token)
+  means resident weights alone won't do it — it needs the whole decode step resident, one command
+  buffer per token, only logits read back.
+- [ ] Port `gpu_kv_cache.rs` from cortex (DELTA_REPORT step 3) — per-layer resident K/V buffers.
 - [ ] AVX-512 and ARM NEON ternary kernels
 - [ ] Heuristic stop conditions for base models (chat currently relies on role-marker scan, no rambling detection)
 - [ ] Block Attention Residuals (MoonshotAI/Attention-Residuals) — learned depth-attention at block boundaries
@@ -48,44 +61,51 @@ Priority order, by measured impact:
 
 ## Perf baseline
 
-BitNet b1.58 2B (Microsoft), 30 layers, 2560 embed, 128256 vocab, 1.58 GB ternary weights, 4096 ctx.
-Hardware: Intel i9-14900HX + RTX 4080 Laptop (discrete). Model load: 5.3 s.
+BitNet b1.58 2B (Microsoft), 30 layers, 2560 embed, 128256 vocab, 4096 ctx.
+Hardware: Intel i9-14900HX + RTX 4080 Laptop (discrete).
 
-**Measured 2026-08-15**, `--release`, 64-token decode. All figures measured, none projected —
-force a backend with `--backend <scalar|avx2|wgpu>` or `TERNARY_BACKEND`.
+**Measured 2026-09-12**, `--release`, 64-token decode. Force a backend with
+`--backend <scalar|avx2|wgpu>` or `TERNARY_BACKEND`.
 
-End-to-end decode (`bitnet-chat`):
-
-| Backend | Decode | vs. previous |
+| Configuration | Decode | Step |
 |---|---|---|
-| wgpu — old presence-driven selection | 2.5 tok/s | baseline |
-| avx2 — measurement-driven selection, serial kernel | 9.2 tok/s | 3.7× |
-| avx2 — parallel kernel *(current auto-selection)* | **20.8 tok/s** | 2.3× |
+| wgpu — presence-driven selection | 2.5 tok/s | baseline |
+| avx2 — measurement-driven selection | 9.2 tok/s | 3.7× |
+| avx2 — kernel threaded over rows | 21.5 tok/s | 2.3× |
+| avx2 — tied embedding kept f16 *(current)* | **27.2 tok/s** | 1.27× |
 
-**8.3× total.** Two changes: `detect()` now races candidates instead of assuming a discrete GPU
-wins, and the AVX2 matvec parallelizes over rows instead of running on one core of 32.
+**10.9× total.** Peak working set dropped 2017 → 1392 MB with the f16 embedding.
 
-Per-matvec (`bitnet-bench`, every backend cross-checked against scalar — all VERIFIED):
+### Where decode time goes
 
-| Backend | Q proj 2560×2560 | FFN gate 6912×2560 | Full-model est. |
-|---|---|---|---|
-| scalar | 20004 µs | 64701 µs | 0.1 tok/s |
-| avx2 | 57 µs | 223 µs | 37.2 tok/s |
-| wgpu | 1381 µs | 5455 µs | 1.5 tok/s |
+Instrumented profile at the 21.5 tok/s state (46.5 ms/token):
 
-**Reading — decode is now memory-bound, not compute-bound.** The model streams ~603 MB of packed
-weights per token (521 MB across 30 layers, GQA-corrected, plus 82 MB for the output head). At
-20.8 tok/s that is ~12.5 GB/s; the gate matvec in isolation hits ~20 GB/s, which is about what this
-laptop's DDR5 sustains. That is why threading returned 2.3× and not core-count, and it means
-further gains come from moving fewer bytes, not from more threads.
+| Phase | ms/tok | Share | Weight bytes | Achieved |
+|---|---|---|---|---|
+| output_proj (tied embedding) | 20.22 | 43.5% | 1.313 GB | 65 GB/s |
+| ffn | 13.47 | 29.0% | 398 MB | 29.6 GB/s |
+| attention | 12.51 | 26.9% | 123 MB | 9.8 GB/s |
+| norms + residuals + embedding lookup | 0.26 | 0.6% | — | — |
 
-Two caveats worth keeping in view:
+RMSNorm, RoPE, softmax and residuals are **0.6% combined** — optimizing them buys nothing.
+The f16 change halves the output projection's bytes, which is where the 27.2 tok/s came from.
 
-- The bench is **cache-warm** (Q proj is 1.6 MB, fits L2), so its full-model estimate flatters CPU:
-  it projected 12.4 tok/s for the serial kernel against 9.2 measured, and projects 37.2 against
-  20.8 now. Treat it as an upper bound on the kernel, not a prediction of decode.
-- The bench bills K and V at full Q size, but GQA makes them ¼ (`head_count=20`,
-  `head_count_kv=5`), overstating per-layer work by ~14%.
+### Correction (2026-09-12)
+
+The bandwidth analysis recorded here on 2026-08-15 was wrong, and the profile is what exposed it:
+
+- It claimed ~603 MB/token. Real figure was **1.83 GB/token** — it omitted the output projection
+  entirely, then mis-sized it as an 82 MB ternary matrix when it was 1.31 GB of f32.
+- It claimed ~20 GB/s was about all this box sustains. The output projection demonstrably reaches
+  **65 GB/s**.
+- It concluded "decode is memory-bound; gains come from moving fewer bytes, not more threads."
+  That held for the output projection only. The ternary blocks run **2–6× below** the achievable
+  bandwidth and are still compute-bound.
+
+Per-matvec figures from `bitnet-bench` remain useful for comparing backends, but treat its
+full-model estimate as an upper bound on the *kernel*, not a prediction of decode: it is cache-warm
+(Q proj is 1.6 MB, fits L2), it bills K/V at full Q size when GQA makes them ¼
+(`head_count=20`, `head_count_kv=5`), and it does not model the output projection at all.
 
 ## Architectural invariants
 
