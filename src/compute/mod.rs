@@ -13,6 +13,7 @@
 //!       └── WgpuBackend       — GPU via wgpu/Vulkan/DX12/Metal (future)
 //! ```
 
+pub mod half;
 pub mod scalar;
 pub mod device;
 #[cfg(target_arch = "x86_64")]

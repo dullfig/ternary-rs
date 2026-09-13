@@ -15,7 +15,7 @@ use crate::layers::kv_cache::ModelKvCache;
 use crate::layers::rmsnorm::RmsNorm;
 use crate::layers::sampler::{Sampler, SamplerConfig};
 use crate::layers::transformer::TransformerBlock;
-use crate::tensor::FloatTensor;
+use crate::tensor::{EmbeddingTable, FloatTensor, HalfTensor};
 use rayon::prelude::*;
 
 /// Number of vocabulary entries per parallel chunk for tied embedding projection.
@@ -50,6 +50,41 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// `weight_data` is row-major `[vocab_size, embed_dim]` — either the embedding
 /// table (tied) or a separate output weight matrix (float projection).
+/// Rayon-parallel output projection against an f16 table (tied embedding).
+///
+/// Mirrors [`float_output_projection`] but converts each weight from f16 on
+/// the fly via [`crate::compute::half::dot_f16`], so the table streams at
+/// half the bytes.
+fn half_output_projection(
+    normed: &[f32],
+    weight_bits: &[u16],
+    seq_len: usize,
+    vocab_size: usize,
+    embed_dim: usize,
+) -> Vec<f32> {
+    let mut logits = vec![0.0f32; seq_len * vocab_size];
+    for t in 0..seq_len {
+        let h_start = t * embed_dim;
+        let h_vec = &normed[h_start..h_start + embed_dim];
+        let token_logits = &mut logits[t * vocab_size..(t + 1) * vocab_size];
+        token_logits
+            .par_chunks_mut(VOCAB_CHUNK_SIZE)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let v_start = chunk_idx * VOCAB_CHUNK_SIZE;
+                for (i, logit) in chunk.iter_mut().enumerate() {
+                    let v = v_start + i;
+                    let e_start = v * embed_dim;
+                    *logit = crate::compute::half::dot_f16(
+                        h_vec,
+                        &weight_bits[e_start..e_start + embed_dim],
+                    );
+                }
+            });
+    }
+    logits
+}
+
 fn float_output_projection(
     normed: &[f32],
     weight_data: &[f32],
@@ -81,7 +116,7 @@ fn float_output_projection(
 /// A complete transformer language model.
 pub struct TransformerModel {
     /// Token embedding table (vocab_size × embed_dim).
-    embedding: FloatTensor,
+    embedding: EmbeddingTable,
     /// Stacked transformer decoder blocks.
     blocks: Vec<TransformerBlock>,
     /// Final normalization before output projection.
@@ -110,7 +145,7 @@ pub enum OutputProjection {
 impl TransformerModel {
     /// Create a transformer model from its components.
     pub fn new(
-        embedding: FloatTensor,
+        embedding: EmbeddingTable,
         blocks: Vec<TransformerBlock>,
         final_norm: RmsNorm,
         output_proj: OutputProjection,
@@ -164,8 +199,13 @@ impl TransformerModel {
     }
 
     /// Access the raw embedding table data (for diagnostics).
-    pub fn embedding_data(&self) -> &[f32] {
-        self.embedding.data()
+    pub fn embedding(&self) -> &EmbeddingTable {
+        &self.embedding
+    }
+
+    /// Row `idx` of the embedding table as f32 (for diagnostics).
+    pub fn embedding_row(&self, idx: usize) -> Vec<f32> {
+        self.embedding.row_f32(idx)
     }
 
     /// Forward pass: token IDs → logits.
@@ -179,15 +219,13 @@ impl TransformerModel {
 
         // 1. Embedding lookup
         let mut hidden = Vec::with_capacity(seq_len * self.embed_dim);
-        let embed_data = self.embedding.data();
         for &tok in tokens {
             assert!(
                 (tok as usize) < self.vocab_size,
                 "token ID {tok} out of range (vocab_size={})",
                 self.vocab_size
             );
-            let start = tok as usize * self.embed_dim;
-            hidden.extend_from_slice(&embed_data[start..start + self.embed_dim]);
+            self.embedding.extend_row(tok as usize, &mut hidden);
         }
 
         // 2. Pass through transformer blocks
@@ -218,7 +256,12 @@ impl TransformerModel {
                 float_output_projection(&normed, weight.data(), seq_len, self.vocab_size, self.embed_dim)
             }
             OutputProjection::TiedEmbedding => {
-                float_output_projection(&normed, embed_data, seq_len, self.vocab_size, self.embed_dim)
+                match &self.embedding {
+                    EmbeddingTable::F32(t) => float_output_projection(
+                        &normed, t.data(), seq_len, self.vocab_size, self.embed_dim),
+                    EmbeddingTable::F16(t) => half_output_projection(
+                        &normed, t.data(), seq_len, self.vocab_size, self.embed_dim),
+                }
             }
         }
     }
@@ -244,15 +287,13 @@ impl TransformerModel {
 
         // 1. Embedding lookup
         let mut hidden = Vec::with_capacity(seq_len * self.embed_dim);
-        let embed_data = self.embedding.data();
         for &tok in tokens {
             assert!(
                 (tok as usize) < self.vocab_size,
                 "token ID {tok} out of range (vocab_size={})",
                 self.vocab_size
             );
-            let start = tok as usize * self.embed_dim;
-            hidden.extend_from_slice(&embed_data[start..start + self.embed_dim]);
+            self.embedding.extend_row(tok as usize, &mut hidden);
         }
 
         // 2. Pass through transformer blocks with cache
@@ -283,7 +324,12 @@ impl TransformerModel {
                 float_output_projection(&normed, weight.data(), seq_len, self.vocab_size, self.embed_dim)
             }
             OutputProjection::TiedEmbedding => {
-                float_output_projection(&normed, embed_data, seq_len, self.vocab_size, self.embed_dim)
+                match &self.embedding {
+                    EmbeddingTable::F32(t) => float_output_projection(
+                        &normed, t.data(), seq_len, self.vocab_size, self.embed_dim),
+                    EmbeddingTable::F16(t) => half_output_projection(
+                        &normed, t.data(), seq_len, self.vocab_size, self.embed_dim),
+                }
             }
         }
     }
@@ -440,7 +486,7 @@ mod tests {
                 embed_data[v * embed_dim + d] = ((v * embed_dim + d) as f32 + 1.0) * 0.01;
             }
         }
-        let embedding = FloatTensor::new(embed_data, vec![vocab_size, embed_dim]);
+        let embedding = EmbeddingTable::F32(FloatTensor::new(embed_data, vec![vocab_size, embed_dim]));
 
         let blocks: Vec<TransformerBlock> = (0..n_layers)
             .map(|_| make_test_block(embed_dim, n_heads, n_kv_heads, intermediate))
@@ -455,6 +501,60 @@ mod tests {
         };
 
         TransformerModel::new(embedding, blocks, final_norm, output_proj)
+    }
+
+
+    // -- Embedding precision parity --
+
+    /// Well-conditioned f16 bit patterns: exponent 11..=15 keeps values in
+    /// roughly [0.06, 2.0), so the tiny test model stays numerically sane.
+    fn tame_half_bits(n: usize) -> Vec<u16> {
+        let mut state: u32 = 0xB5297A4D;
+        (0..n)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let sign = ((i % 3) == 0) as u16;
+                let exp = 11 + (state >> 20) as u16 % 5;
+                let mant = (state >> 4) as u16 & 0x3FF;
+                (sign << 15) | (exp << 10) | mant
+            })
+            .collect()
+    }
+
+    fn model_with_embedding(table: EmbeddingTable) -> TransformerModel {
+        let embed_dim = table.cols();
+        let blocks = vec![make_test_block(embed_dim, 2, 2, 16)];
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-5);
+        TransformerModel::new(table, blocks, final_norm, OutputProjection::TiedEmbedding)
+    }
+
+    #[test]
+    fn tied_projection_matches_across_embedding_precision() {
+        let (vocab, embed_dim) = (8, 8);
+        let bits = tame_half_bits(vocab * embed_dim);
+        let floats: Vec<f32> = bits.iter().map(|&h| crate::gguf::f16_to_f32(h)).collect();
+
+        // Identical values, two representations.
+        let m16 = model_with_embedding(EmbeddingTable::F16(HalfTensor::new(
+            bits,
+            vec![vocab, embed_dim],
+        )));
+        let m32 = model_with_embedding(EmbeddingTable::F32(FloatTensor::new(
+            floats,
+            vec![vocab, embed_dim],
+        )));
+
+        let tokens = [1u32, 5, 3, 0];
+        let l16 = m16.forward(&tokens, 0);
+        let l32 = m32.forward(&tokens, 0);
+
+        assert_eq!(l16.len(), l32.len());
+        for (i, (a, b)) in l16.iter().zip(l32.iter()).enumerate() {
+            assert!(a.is_finite() && b.is_finite(), "logit {i} not finite");
+            // Only the summation order differs; conversion itself is exact.
+            let tol = 1e-4 * b.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "logit {i}: f16 {a} vs f32 {b}");
+        }
     }
 
     // -- Construction --

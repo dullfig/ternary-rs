@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::tensor::{FloatTensor, Ternary, TernaryTensor};
+use crate::tensor::{EmbeddingTable, HalfTensor, FloatTensor, Ternary, TernaryTensor};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -355,7 +355,7 @@ impl<R: Read + Seek> GgufReader<R> {
 /// Convert an IEEE 754 half-precision (f16) value to f32.
 ///
 /// Layout: 1 sign | 5 exponent | 10 mantissa
-fn f16_to_f32(bits: u16) -> f32 {
+pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;
@@ -949,6 +949,43 @@ impl GgufFile {
         );
 
         Ok(FloatTensor::new(float_data, info.shape.clone()))
+    }
+
+    /// Load the token embedding table, preserving f16 storage.
+    ///
+    /// An F16 source stays f16 in memory rather than expanding to f32. When
+    /// the output projection is tied to this table it is re-read in full for
+    /// every generated token, so keeping it half-width halves the bytes moved
+    /// by the hottest op in decode. Conversion f16 -> f32 is exact, so this
+    /// costs no precision. Any other source dtype loads as f32 as before.
+    pub fn load_embedding(&self, name: &str) -> Result<EmbeddingTable> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| GgufError::MissingMetadata(name.to_string()))?;
+
+        let data = self.read_tensor_data(info)?;
+        let n = info.n_elements as usize;
+
+        match info.ggml_type {
+            GgmlType::F16 => {
+                let bits: Vec<u16> = data
+                    .chunks_exact(2)
+                    .take(n)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                debug!(name, n_elements = n, "loaded embedding table (f16, kept half)");
+                Ok(EmbeddingTable::F16(HalfTensor::new(bits, info.shape.clone())))
+            }
+            other => {
+                let float_data = load_float_data(&data, other, info.n_elements);
+                debug!(name, ?other, n_elements = n, "loaded embedding table (f32)");
+                Ok(EmbeddingTable::F32(FloatTensor::new(
+                    float_data,
+                    info.shape.clone(),
+                )))
+            }
+        }
     }
 
     /// Load the first `n` raw bytes of a tensor (for diagnostics).

@@ -128,7 +128,7 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
     info!(backend = backend.name(), "compute backend selected");
 
     // Embedding table
-    let embedding = gguf.load_float("token_embd.weight")?;
+    let embedding = gguf.load_embedding("token_embd.weight")?;
     info!("loaded embedding: {:?}", embedding.shape());
 
     // Transformer blocks

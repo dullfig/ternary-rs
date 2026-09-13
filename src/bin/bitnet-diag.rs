@@ -207,9 +207,10 @@ fn attention_probe(gguf: &GgufFile, loaded: &ternary_rs::loader::LoadedModel) {
         tok0, tok.token(tok0), tok1, tok.token(tok1));
 
     // Look up embeddings
-    let embed_data = loaded.model.embedding_data();
-    let emb0 = &embed_data[tok0 as usize * embed_dim..(tok0 as usize + 1) * embed_dim];
-    let emb1 = &embed_data[tok1 as usize * embed_dim..(tok1 as usize + 1) * embed_dim];
+    let emb0_row = loaded.model.embedding_row(tok0 as usize);
+    let emb1_row = loaded.model.embedding_row(tok1 as usize);
+    let emb0 = &emb0_row[..];
+    let emb1 = &emb1_row[..];
 
     // Project through Q and K
     let q0 = q_proj.forward(emb0);

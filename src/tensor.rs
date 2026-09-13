@@ -313,6 +313,107 @@ impl fmt::Debug for FloatTensor {
 // Tests
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// Embedding table
+// ---------------------------------------------------------------------------
+
+/// Half-precision tensor: raw IEEE 754 f16 bits, converted on read.
+///
+/// Used for the token embedding table, which GGUF stores as F16. Expanding
+/// it to f32 at load would double the bytes streamed by the tied output
+/// projection — the single hottest op in decode.
+#[derive(Debug, Clone)]
+pub struct HalfTensor {
+    data: Vec<u16>,
+    shape: Vec<usize>,
+}
+
+impl HalfTensor {
+    pub fn new(data: Vec<u16>, shape: Vec<usize>) -> Self {
+        let expected: usize = shape.iter().product();
+        assert_eq!(data.len(), expected, "data length must match shape");
+        Self { data, shape }
+    }
+
+    /// Raw f16 bits, row-major.
+    #[inline]
+    pub fn data(&self) -> &[u16] { &self.data }
+
+    #[inline]
+    pub fn shape(&self) -> &[usize] { &self.shape }
+}
+
+/// Token embedding table, held in whatever precision the model supplied.
+///
+/// F16 sources stay f16: the table is re-read in full for every generated
+/// token when the output projection is tied to it, so halving its footprint
+/// halves the bytes moved on that op. Conversion f16 -> f32 is exact, so no
+/// precision is lost relative to expanding at load time; only the order of
+/// summation in the projection differs, at the last ulp.
+#[derive(Debug, Clone)]
+pub enum EmbeddingTable {
+    F32(FloatTensor),
+    F16(HalfTensor),
+}
+
+impl EmbeddingTable {
+    #[inline]
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Self::F32(t) => t.shape(),
+            Self::F16(t) => t.shape(),
+        }
+    }
+
+    #[inline]
+    pub fn rows(&self) -> usize { self.shape()[0] }
+
+    #[inline]
+    pub fn cols(&self) -> usize { self.shape()[1] }
+
+    /// Bytes of weight data held.
+    pub fn bytes(&self) -> usize {
+        match self {
+            Self::F32(t) => t.data().len() * std::mem::size_of::<f32>(),
+            Self::F16(t) => t.data().len() * std::mem::size_of::<u16>(),
+        }
+    }
+
+    /// Borrow the f32 payload, if this table is f32.
+    #[inline]
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        match self { Self::F32(t) => Some(t.data()), Self::F16(_) => None }
+    }
+
+    /// Borrow the raw f16 bits, if this table is f16.
+    #[inline]
+    pub fn as_f16(&self) -> Option<&[u16]> {
+        match self { Self::F16(t) => Some(t.data()), Self::F32(_) => None }
+    }
+
+    /// Append row `idx` to `out`, converting if needed.
+    pub fn extend_row(&self, idx: usize, out: &mut Vec<f32>) {
+        let cols = self.cols();
+        let start = idx * cols;
+        match self {
+            Self::F32(t) => out.extend_from_slice(&t.data()[start..start + cols]),
+            Self::F16(t) => out.extend(
+                t.data()[start..start + cols]
+                    .iter()
+                    .map(|&h| crate::gguf::f16_to_f32(h)),
+            ),
+        }
+    }
+
+    /// Row `idx` as an owned f32 vector.
+    pub fn row_f32(&self, idx: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.cols());
+        self.extend_row(idx, &mut out);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +584,80 @@ mod tests {
         let ternary_bytes = (n + 3) / 4;
         let ratio = f32_bytes as f64 / ternary_bytes as f64;
         assert!((ratio - 16.0).abs() < 0.1, "expected ~16× compression, got {ratio}×");
+    }
+
+    // -- Embedding table (f16 / f32) --
+
+    /// f16 bit patterns avoiding exp==31 (Inf/NaN).
+    fn half_bits(n: usize) -> Vec<u16> {
+        let mut state: u32 = 0x9E37_79B9;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let bits = (state >> 8) as u16;
+                if (bits >> 10) & 0x1F == 0x1F { bits & 0xE3FF } else { bits }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn half_embedding_row_converts_exactly() {
+        let (rows, cols) = (4, 8);
+        let bits = half_bits(rows * cols);
+        let table = EmbeddingTable::F16(HalfTensor::new(bits.clone(), vec![rows, cols]));
+
+        for r in 0..rows {
+            let got = table.row_f32(r);
+            let want: Vec<f32> = bits[r * cols..(r + 1) * cols]
+                .iter()
+                .map(|&h| crate::gguf::f16_to_f32(h))
+                .collect();
+            assert_eq!(got, want, "row {r}");
+        }
+    }
+
+    #[test]
+    fn half_and_float_embeddings_expose_same_values() {
+        // Build an f32 table by converting the same bits, so the two
+        // representations hold identical values.
+        let (rows, cols) = (5, 8);
+        let bits = half_bits(rows * cols);
+        let floats: Vec<f32> = bits.iter().map(|&h| crate::gguf::f16_to_f32(h)).collect();
+
+        let half = EmbeddingTable::F16(HalfTensor::new(bits, vec![rows, cols]));
+        let full = EmbeddingTable::F32(FloatTensor::new(floats, vec![rows, cols]));
+
+        assert_eq!(half.rows(), full.rows());
+        assert_eq!(half.cols(), full.cols());
+        for r in 0..rows {
+            assert_eq!(half.row_f32(r), full.row_f32(r), "row {r}");
+        }
+    }
+
+    #[test]
+    fn half_embedding_uses_half_the_bytes() {
+        let (rows, cols) = (64, 32);
+        let bits = half_bits(rows * cols);
+        let floats: Vec<f32> = bits.iter().map(|&h| crate::gguf::f16_to_f32(h)).collect();
+
+        let half = EmbeddingTable::F16(HalfTensor::new(bits, vec![rows, cols]));
+        let full = EmbeddingTable::F32(FloatTensor::new(floats, vec![rows, cols]));
+
+        assert_eq!(half.bytes() * 2, full.bytes());
+    }
+
+    #[test]
+    fn extend_row_appends_without_allocating_a_vec() {
+        let (rows, cols) = (3, 8);
+        let bits = half_bits(rows * cols);
+        let table = EmbeddingTable::F16(HalfTensor::new(bits, vec![rows, cols]));
+
+        let mut out = Vec::with_capacity(2 * cols);
+        table.extend_row(2, &mut out);
+        table.extend_row(0, &mut out);
+
+        assert_eq!(out.len(), 2 * cols);
+        assert_eq!(&out[..cols], &table.row_f32(2)[..]);
+        assert_eq!(&out[cols..], &table.row_f32(0)[..]);
     }
 }
