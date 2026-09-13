@@ -113,6 +113,7 @@ These are load-bearing and shouldn't be relaxed without going through the integr
 
 - **Ternary only.** f16/Q4_K_M dequantization belongs in cortex, not here. Don't re-add a `LinearLayer` trait, `FloatLinear`, or K-quant dequant module.
 - **F32 activations end-to-end.** Never pack activations to f16/bf16. (Per `project_f32_activations_invariant` — learned from cortex's NaN saga during the merger period.)
+  This constrains *activations*, not weight storage. Keeping the embedding table in its source f16 (see `EmbeddingTable`) is not a breach: the weights were already f16 on disk, conversion to f32 is exact, and every activation on the path stays f32. Downcasting an f32 source to f16 *would* be a breach — `load_embedding` never does it.
 - **Plain f32 at layer boundaries.** No custom tensor framework lock-in; layers communicate via `&[f32]`.
 - **Zero `unsafe` in hot paths.** The AVX2 kernel uses `#[target_feature]` + intrinsics, which are unsafe by construction; those are the only `unsafe` blocks and each is guarded by runtime feature detection. Matches the wording in CLAUDE.md. (The stricter "zero `unsafe`, SIMD via safe abstractions only" claim this replaces was never true of `avx2.rs`.)
 - **Ternary encoding:** `0b00 = -1`, `0b01 = 0`, `0b10 = +1`, `0b11` unused. GGUF TQ2_0 uses a different convention (0=neg, 1=zero, 2=pos) and is remapped on load.
